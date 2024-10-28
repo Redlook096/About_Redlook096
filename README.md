@@ -6,7 +6,7 @@
 - 😄 Pronouns: He/Him
 
 CURRENT PROJECT: Amelia AI 2.0
-Amelia 1.0 was a class project conducted by another student, 
+Amelia 1.0 was a class project conducted with @NexGenConsultingServices, 
 here is the new and improved Amelia 2.0. This chatbot is 
 still under development but has some interesting features. 
 It can do math questions, remember your name, have better 
