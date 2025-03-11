@@ -4,7 +4,7 @@
 - 💞️ I’m looking to collaborate on AI and Systems
 - 📫 How to reach me - SMS or Whatsapp me +61 426 613 650
 - 😄 Pronouns: He/Him
-- I am Luke Simpson, an Aquith Boyd High school student
+- I am Luke Simpson, an Aquith Boys High school student
 CURRENT PROJECT: Amelia AI 2.0
 Amelia 1.0 was a class project conducted with @NexGenConsultingServices, 
 here is the new and improved Amelia 2.0. This chatbot is 
