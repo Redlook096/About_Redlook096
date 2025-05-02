@@ -1,17 +1,14 @@
 - 👋 Hi, I’m @Redlook096
-- 👀 I’m interested in Python, CSS and HTML
-- 🌱 I’m currently learning C++
-- 💞️ I’m looking to collaborate on AI and Systems
+- 👀 I’m interested in Python, CSS HTML, Javascript and AI
+- 🌱 I’m currently learning Artificial Intelligence and GUI
 - 📫 How to reach me - SMS or Whatsapp me +61 426 613 650
+- 📩 Email luke.simposn096@gmail.com
 - 😄 Pronouns: He/Him
-- I am Luke Simpson, an Aquith Boys High school student
-CURRENT PROJECT: Amelia AI 2.0
-Amelia 1.0 was a class project conducted with @NexGenConsultingServices, 
-here is the new and improved Amelia 2.0. This chatbot is 
-still under development but has some interesting features. 
-It can do math questions, remember your name, have better 
-input recognition ect. Read README.txt for installation process.
-Go to: https://github.com/Redlook096/Amelia-AI2.0
-l programmed Amelia AI 2.0 by myself and will continue to
-bring updates to it, please contact me for feedback or for 
-an opportunity to collaborate with me.
+- 🪪Luke Simpson
+- Additional Information:
+l am a student from NSW Australia and have been programming a a couple years now. l am 16
+and am developing something big to soon make public. My last project,
+[Amelia AI](https://github.com/Redlook096/Amelia-AI2.0/tree/main) 2.0 was my
+first AI project that showed what l could achieve before learning deeper. My next project
+will hopefully be on the web with clean GUI and efficient API keys to run the model.
+
