@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>OpenCluely</title>
+    <link href="./dist/output.css" rel="stylesheet" />
+    <link href="./src/styles/common.css" rel="stylesheet" />
+    <style>
+      :root {
+        --oc-glass: rgba(248, 249, 251, 0.88);
+        --oc-glass-open: rgba(255, 255, 255, 0.94);
+        --oc-border: rgba(15, 23, 42, 0.08);
+        --oc-text: #3d4656;
+        --oc-text-strong: #1e293b;
+        --oc-shadow: 0 10px 28px rgba(15, 23, 42, 0.09), 0 2px 6px rgba(15, 23, 42, 0.04);
+        --oc-btn-bg: rgba(255, 255, 255, 0.78);
+        --oc-btn-border: rgba(15, 23, 42, 0.06);
+        --oc-close-bg: #ffffff;
+        --oc-close-fg: #5b6575;
+        --oc-drag: #8b95a5;
+        --oc-input-bg: #ffffff;
+        --oc-input-border: #dfe4e9;
+        --oc-msg-bg: transparent;
+        --oc-user-bubble: #aec7f1;
+        --oc-user-bubble-border: rgba(148, 163, 184, 0.28);
+        --oc-assistant-fg: #1e293b;
+        --oc-hint: #8b96a5;
+        --oc-ease: cubic-bezier(0.16, 1, 0.3, 1);
+        --oc-ease-soft: cubic-bezier(0.33, 1, 0.68, 1);
+        --oc-dur-w: 340ms;
+        --oc-dur-h: 360ms;
+        --oc-dur-fast: 180ms;
+        --oc-expanded-w: 560px;
+        --oc-bar-h: 52px;
+        --oc-drawer-h: 340px;
+        --oc-control-bg: linear-gradient(180deg, #1e2a44 0%, #152038 55%, #101a2e 100%);
+        --oc-stealth-on: linear-gradient(180deg, #1e2a44 0%, #152038 55%, #101a2e 100%);
+        --oc-stealth-accent: #7dd3fc;
+        --oc-glow: #3b82f6;
+      }
+
+      /* System dark theme (separate from Stealth) */
+      html.oc-dark {
+        --oc-glass: rgba(22, 27, 34, 0.88);
+        --oc-glass-open: rgba(17, 24, 39, 0.94);
+        --oc-border: rgba(148, 163, 184, 0.16);
+        --oc-text: #cbd5e1;
+        --oc-text-strong: #f1f5f9;
+        --oc-shadow: 0 12px 32px rgba(0, 0, 0, 0.42), 0 2px 8px rgba(0, 0, 0, 0.24);
+        --oc-btn-bg: rgba(30, 41, 59, 0.9);
+        --oc-btn-border: rgba(148, 163, 184, 0.16);
+        --oc-close-bg: rgba(30, 41, 59, 0.96);
+        --oc-close-fg: #e2e8f0;
+        --oc-drag: #94a3b8;
+        --oc-input-bg: #0f172a;
+        --oc-input-border: rgba(148, 163, 184, 0.22);
+        --oc-msg-bg: transparent;
+        --oc-user-bubble: #334155;
+        --oc-user-bubble-border: rgba(148, 163, 184, 0.28);
+        --oc-assistant-fg: #e2e8f0;
+        --oc-hint: #94a3b8;
+        --oc-glow: #60a5fa;
+      }
+
+      html.oc-stealth {
+        --oc-glass: rgba(22, 27, 34, 0.9);
+        --oc-glass-open: rgba(17, 24, 39, 0.96);
+        --oc-border: rgba(148, 163, 184, 0.14);
+        --oc-text: #cbd5e1;
+        --oc-text-strong: #f1f5f9;
+        --oc-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.28);
+        --oc-btn-bg: rgba(30, 41, 59, 0.88);
+        --oc-btn-border: rgba(148, 163, 184, 0.14);
+        --oc-close-bg: rgba(30, 41, 59, 0.96);
+        --oc-close-fg: #e2e8f0;
+        --oc-drag: #94a3b8;
+        --oc-input-bg: rgba(15, 23, 42, 0.95);
+        --oc-input-border: rgba(125, 211, 252, 0.22);
+        --oc-msg-bg: transparent;
+        --oc-user-bubble: rgba(125, 211, 252, 0.16);
+        --oc-user-bubble-border: rgba(125, 211, 252, 0.28);
+        --oc-assistant-fg: #e2e8f0;
+        --oc-hint: #94a3b8;
+        --oc-glow: #7dd3fc;
+      }
+
+      * { box-sizing: border-box; }
+
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: fit-content;
+        height: fit-content;
+        background: transparent !important;
+        overflow: hidden;
+        font-family: "SF Pro Text", "Segoe UI", Inter, system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -webkit-app-region: no-drag;
+        color-scheme: light;
+        transition: color-scheme 280ms ease;
+      }
+      html.oc-dark, html.oc-dark body,
+      html.oc-stealth, html.oc-stealth body { color-scheme: dark; }
+
+      .oc-shell {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        width: max-content;
+        min-width: 400px;
+        background: transparent;
+        border-radius: 999px;
+        overflow: hidden;
+        opacity: 1;
+        position: relative;
+        /* Grow downward from the top edge — never shift vertically. */
+        transform-origin: top center;
+        transition:
+          width var(--oc-dur-w) var(--oc-ease),
+          min-width var(--oc-dur-w) var(--oc-ease),
+          border-radius var(--oc-dur-h) var(--oc-ease),
+          background 280ms var(--oc-ease-soft),
+          box-shadow 280ms var(--oc-ease-soft),
+          border-color 280ms var(--oc-ease-soft),
+          opacity 220ms var(--oc-ease);
+        will-change: width, opacity;
+      }
+      .oc-shell.is-ask-fade {
+        animation: oc-ask-fade-down 340ms var(--oc-ease) both;
+      }
+      @keyframes oc-ask-fade-down {
+        from { opacity: 0.72; }
+        to { opacity: 1; }
+      }
+      /* Subtle blue glow line traveling the full border while AI thinks */
+      .oc-shell.is-thinking::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        padding: 1.5px;
+        background: conic-gradient(from var(--oc-glow-angle, 0deg), transparent 0%, transparent 62%, rgba(59,130,246,0.05) 72%, var(--oc-glow) 86%, rgba(225,238,255,0.85) 92%, transparent 100%);
+        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        -webkit-mask-composite: xor;
+        mask-composite: exclude;
+        pointer-events: none;
+        z-index: 8;
+        animation: oc-glow-spin 1.8s linear infinite;
+        opacity: 0.9;
+      }
+      @property --oc-glow-angle {
+        syntax: "<angle>";
+        inherits: false;
+        initial-value: 0deg;
+      }
+      @keyframes oc-glow-spin {
+        to { --oc-glow-angle: 360deg; }
+      }
+      @supports not (background: conic-gradient(from var(--oc-glow-angle), #000, #fff)) {
+        .oc-shell.is-thinking::before {
+          background: linear-gradient(90deg, transparent, rgba(59,130,246,0.35), rgba(225,238,255,0.7), rgba(59,130,246,0.35), transparent);
+          background-size: 200% 100%;
+          animation: oc-glow-slide 1.6s linear infinite;
+          -webkit-mask: none;
+          mask: none;
+          border-radius: inherit;
+          padding: 0;
+          border: 1.5px solid transparent;
+          opacity: 0.55;
+        }
+        @keyframes oc-glow-slide {
+          0% { background-position: 100% 0; }
+          100% { background-position: -100% 0; }
+        }
+      }
+
+      .oc-shell.is-boot-squish {
+        width: 56px !important;
+        min-width: 56px !important;
+        opacity: 0;
+        transform: scaleX(0.22) scaleY(0.92);
+        pointer-events: none;
+      }
+      .oc-shell.is-boot-squish .oc-boot-hide {
+        opacity: 0 !important;
+        transform: translateX(-6px) scale(0.92);
+        pointer-events: none;
+      }
+      .oc-shell.is-boot-fade {
+        opacity: 1;
+        transform: scaleX(0.28) scaleY(0.96);
+      }
+      .oc-shell.is-boot-expand {
+        opacity: 1;
+        transform: none;
+        width: max-content;
+        min-width: 400px;
+      }
+      .oc-shell.is-boot-reveal .oc-boot-hide {
+        opacity: 1;
+        transform: none;
+        pointer-events: auto;
+        transition: opacity 360ms var(--oc-ease), transform 420ms var(--oc-ease);
+      }
+      .oc-shell.is-boot-reveal .oc-boot-hide:nth-child(1) { transition-delay: 40ms; }
+      .oc-shell.is-boot-reveal .oc-boot-hide:nth-child(2) { transition-delay: 90ms; }
+      .oc-shell.is-boot-reveal .oc-boot-hide:nth-child(3) { transition-delay: 140ms; }
+      .oc-shell.is-boot-reveal .oc-boot-hide:nth-child(4) { transition-delay: 190ms; }
+      .oc-shell.is-boot-reveal .oc-stealth-wrap { transition-delay: 220ms; }
+      .oc-shell.is-boot-reveal .oc-drag { transition-delay: 260ms; }
+
+      .oc-shell.is-wide,
+      .oc-shell.is-chat-open {
+        width: var(--oc-expanded-w);
+        border-radius: 22px;
+        background: var(--oc-glass-open);
+        border: 1px solid var(--oc-border);
+        box-shadow: var(--oc-shadow);
+        backdrop-filter: blur(28px) saturate(1.2);
+        -webkit-backdrop-filter: blur(28px) saturate(1.2);
+      }
+
+      .command-tab {
+        height: var(--oc-bar-h);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 8px 0 8px;
+        width: max-content;
+        min-width: 400px;
+        background: var(--oc-glass);
+        border: 1px solid rgba(255, 255, 255, 0.78);
+        border-radius: 999px;
+        box-shadow: var(--oc-shadow);
+        backdrop-filter: blur(28px) saturate(1.25);
+        -webkit-backdrop-filter: blur(28px) saturate(1.25);
+        -webkit-app-region: drag;
+        transition:
+          width var(--oc-dur-w) var(--oc-ease),
+          min-width var(--oc-dur-w) var(--oc-ease),
+          border-radius var(--oc-dur-h) var(--oc-ease-soft),
+          background 420ms var(--oc-ease-soft),
+          box-shadow 420ms var(--oc-ease-soft),
+          border-color 420ms var(--oc-ease-soft),
+          opacity 280ms var(--oc-ease-soft);
+      }
+      html.oc-stealth .command-tab {
+        border-color: rgba(148, 163, 184, 0.22);
+      }
+
+      .oc-shell.is-wide:not(.is-chat-open) .command-tab {
+        /* Width expands first — keep the rounded pill until chat drops down */
+        width: 100%;
+        min-width: 0;
+        border-radius: 999px;
+      }
+      .oc-shell.is-wide.is-chat-open .command-tab,
+      .oc-shell.is-chat-open .command-tab {
+        width: 100%;
+        min-width: 0;
+        border-radius: 22px 22px 0 0;
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+      }
+      .oc-shell.is-chat-open .command-tab {
+        border-bottom: 1px solid var(--oc-border);
+      }
+
+      /* Circular X / chevron */
+      .oc-close {
+        width: 34px;
+        height: 34px;
+        border-radius: 999px;
+        border: none;
+        background: var(--oc-close-bg);
+        color: var(--oc-close-fg);
+        display: inline-grid;
+        place-items: center;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+        -webkit-app-region: no-drag;
+        transition: transform 180ms var(--oc-ease), background 220ms ease, color 220ms ease;
+        flex-shrink: 0;
+        position: relative;
+      }
+      html.oc-stealth .oc-close { box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35); }
+      .oc-close:hover { filter: brightness(1.04); transform: scale(1.04); }
+      .oc-close svg {
+        width: 12px;
+        height: 12px;
+        position: absolute;
+        transition: opacity 220ms ease, transform 260ms var(--oc-ease);
+      }
+      .oc-close .oc-icon-x { opacity: 1; transform: rotate(0deg) scale(1); }
+      .oc-close .oc-icon-chevron { opacity: 0; transform: rotate(-90deg) scale(0.7); }
+      /* Chat expanded (Ask / Auto Answer / control chat) → down chevron to collapse */
+      .oc-shell.is-chat-open .oc-close .oc-icon-x,
+      .oc-shell.is-wide.is-chat-open .oc-close .oc-icon-x,
+      .oc-shell.is-task-prompt .oc-close .oc-icon-x,
+      .oc-shell.is-control-compose .oc-close .oc-icon-x,
+      .oc-close.is-collapse .oc-icon-x {
+        opacity: 0; transform: rotate(90deg) scale(0.7);
+      }
+      .oc-shell.is-chat-open .oc-close .oc-icon-chevron,
+      .oc-shell.is-wide.is-chat-open .oc-close .oc-icon-chevron,
+      .oc-shell.is-task-prompt .oc-close .oc-icon-chevron,
+      .oc-shell.is-control-compose .oc-close .oc-icon-chevron,
+      .oc-close.is-collapse .oc-icon-chevron {
+        opacity: 1; transform: rotate(0deg) scale(1);
+      }
+      .oc-close .oc-icon-chevron {
+        width: 14px;
+        height: 14px;
+      }
+
+      .oc-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-left: auto;
+        -webkit-app-region: no-drag;
+        flex-shrink: 1;
+        min-width: 0;
+      }
+      .oc-shell.is-wide .command-tab,
+      .oc-shell.is-chat-open .command-tab {
+        /* Keep left/right chrome optically balanced when expanded */
+        padding-inline: 10px;
+      }
+      .oc-shell.is-chat-open .oc-drag,
+      .oc-shell.is-wide .oc-drag {
+        margin-left: 0;
+      }
+      .oc-trailing {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+        margin-left: 2px;
+        -webkit-app-region: no-drag;
+      }
+      .oc-shell.is-chat-open .oc-trailing {
+        margin-right: 0;
+      }
+      .oc-pill-btn {
+        height: 36px;
+        padding: 0 12px;
+        border-radius: 999px;
+        border: 1px solid var(--oc-btn-border);
+        background: var(--oc-btn-bg);
+        color: var(--oc-text);
+        font-size: 13px;
+        font-weight: 550;
+        letter-spacing: -0.01em;
+        cursor: pointer;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        transition: transform 180ms var(--oc-ease), background 220ms ease, box-shadow 180ms ease, color 220ms ease, border-color 220ms ease, opacity 360ms var(--oc-ease);
+        white-space: nowrap;
+      }
+      .oc-pill-btn .oc-btn-icon {
+        width: 15px;
+        height: 15px;
+        flex-shrink: 0;
+        display: block;
+        transition: transform 280ms var(--oc-ease), opacity 200ms ease;
+        transform-origin: center;
+      }
+      .oc-pill-btn .oc-btn-label { line-height: 1; }
+      .oc-pill-btn:hover {
+        background: color-mix(in srgb, var(--oc-btn-bg) 86%, #dbeafe 14%);
+        color: var(--oc-text-strong);
+        border-color: color-mix(in srgb, var(--oc-btn-border) 70%, #93c5fd 30%);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+      }
+      .oc-pill-btn:hover .oc-btn-icon {
+        transform: scale(1.08) rotate(-4deg);
+      }
+      .oc-pill-btn:active { transform: translateY(0); }
+      .oc-pill-btn:active .oc-btn-icon { transform: scale(0.96); }
+      .oc-pill-btn.is-active {
+        background: rgba(243, 244, 246, 0.95);
+        color: var(--oc-text-strong);
+        border-color: rgba(15, 23, 42, 0.12);
+        box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.05);
+      }
+      html.oc-stealth .oc-pill-btn.is-active {
+        background: rgba(125, 211, 252, 0.14);
+        color: #e0f2fe;
+        border-color: rgba(125, 211, 252, 0.28);
+      }
+
+      /* Take Control — same white pill as Ask / Auto on light theme */
+      .oc-pill-btn.oc-control {
+        background: var(--oc-btn-bg);
+        color: var(--oc-text);
+        border-color: var(--oc-btn-border);
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+        padding: 0 12px;
+      }
+      .oc-pill-btn.oc-control:hover {
+        filter: brightness(1.03);
+        color: var(--oc-text-strong);
+      }
+      .oc-pill-btn.oc-stop {
+        background: linear-gradient(180deg, #ef4444 0%, #dc2626 100%);
+        color: #fff;
+        border-color: rgba(185, 28, 28, 0.5);
+        box-shadow: 0 4px 14px rgba(220, 38, 38, 0.32);
+      }
+      .oc-pill-btn.oc-stop:hover { filter: brightness(1.05); color: #fff; }
+      .oc-pill-btn.oc-stop .oc-icon-control { display: none; }
+      .oc-pill-btn.oc-control .oc-icon-stop { display: none; }
+      .oc-pill-btn.oc-stop .oc-icon-stop { display: block; }
+      .oc-pill-btn.oc-stop .oc-label-control { display: none; }
+      .oc-pill-btn.oc-control .oc-label-stop { display: none; }
+      .oc-pill-btn.oc-stop .oc-label-stop { display: inline; }
+
+      /* Stealth — matches pill language */
+      .oc-stealth-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        height: 36px;
+        padding: 0 10px 0 12px;
+        border-radius: 999px;
+        border: 1px solid var(--oc-btn-border);
+        background: var(--oc-btn-bg);
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+        flex-shrink: 0;
+        cursor: pointer;
+        position: relative;
+        z-index: 5;
+        transition: background 280ms ease, border-color 280ms ease, box-shadow 280ms ease, color 240ms ease, opacity 360ms var(--oc-ease), transform 420ms var(--oc-ease);
+      }
+      .oc-stealth-wrap.is-on {
+        background: var(--oc-stealth-on);
+        border-color: rgba(125, 211, 252, 0.28);
+        box-shadow: 0 4px 14px rgba(16, 26, 46, 0.28);
+      }
+      .oc-stealth-label {
+        font-size: 12px;
+        font-weight: 550;
+        letter-spacing: -0.01em;
+        color: var(--oc-text);
+        user-select: none;
+        pointer-events: none;
+      }
+      .oc-stealth-wrap.is-on .oc-stealth-label { color: #fff; }
+      .oc-stealth-switch {
+        position: relative;
+        width: 40px;
+        height: 24px;
+        border-radius: 999px;
+        border: none;
+        padding: 0;
+        background: rgba(148, 163, 184, 0.42);
+        cursor: pointer;
+        transition: background 240ms ease;
+        flex-shrink: 0;
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+        z-index: 6;
+      }
+      .oc-stealth-switch::after {
+        content: "";
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.25);
+        transition: transform 260ms var(--oc-ease), box-shadow 240ms ease;
+        pointer-events: none;
+      }
+      .oc-stealth-wrap.is-on .oc-stealth-switch {
+        background: rgba(125, 211, 252, 0.35);
+      }
+      .oc-stealth-wrap.is-on .oc-stealth-switch::after {
+        transform: translateX(16px);
+        background: #7dd3fc;
+        box-shadow: 0 0 10px rgba(125, 211, 252, 0.65), 0 1px 3px rgba(15, 23, 42, 0.2);
+      }
+
+      /* Circular drag grip (6 dots) */
+      .oc-drag {
+        width: 34px;
+        height: 34px;
+        border-radius: 999px;
+        border: none;
+        background: var(--oc-close-bg);
+        color: var(--oc-drag);
+        display: inline-grid;
+        place-items: center;
+        cursor: grab;
+        -webkit-app-region: drag;
+        flex-shrink: 0;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+        transition: color 160ms ease, background 160ms ease, opacity 360ms var(--oc-ease), transform 420ms var(--oc-ease);
+      }
+      html.oc-stealth .oc-drag { box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35); }
+      .oc-drag:hover { color: var(--oc-text); filter: brightness(1.03); }
+      .oc-drag:active { cursor: grabbing; }
+      .oc-drag-dots {
+        display: grid;
+        grid-template-columns: repeat(2, 3px);
+        gap: 3px;
+      }
+      .oc-drag-dots span {
+        width: 3px;
+        height: 3px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      /* Chat drawer — animate height (not max-height) for butter-smooth expand-down */
+      .chat-drawer {
+        width: 100%;
+        height: 0;
+        opacity: 0;
+        overflow: hidden;
+        pointer-events: none;
+        transition:
+          height var(--oc-dur-h) var(--oc-ease),
+          opacity 320ms var(--oc-ease-soft);
+      }
+      .oc-shell.is-chat-open .chat-drawer {
+        height: var(--oc-drawer-h);
+        opacity: 1;
+        pointer-events: auto;
+      }
+      .oc-shell.is-animating {
+        will-change: width, min-width, border-radius;
+      }
+      .oc-shell.is-animating .chat-drawer {
+        will-change: height, opacity;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .oc-shell,
+        .oc-shell *,
+        .chat-drawer {
+          transition-duration: 0.01ms !important;
+        }
+        .oc-shell.is-thinking::before,
+        .oc-pill-btn .oc-btn-icon,
+        .chat-messages .message.user .message-text,
+        .chat-messages .message.assistant .message-text {
+          animation: none !important;
+        }
+      }
+      .chat-drawer-inner {
+        height: calc(var(--oc-drawer-h) - 8px);
+        display: flex;
+        flex-direction: column;
+        background: transparent;
+        -webkit-app-region: no-drag;
+      }
+      .chat-drawer-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 14px 6px;
+        color: var(--oc-text-strong);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .chat-drawer-header .hint {
+        color: var(--oc-hint);
+        font-weight: 500;
+        font-size: 11px;
+      }
+      .chat-messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 4px 14px 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      /* Chat-tool parity: assistant is print text (no bubble); user keeps bubble + rise animation */
+      .chat-messages .message {
+        max-width: 94%;
+        margin: 0;
+        padding: 0;
+        border: none;
+        border-radius: 0;
+        background: transparent !important;
+        box-shadow: none !important;
+        font-size: 13px;
+        line-height: 1.5;
+        color: var(--oc-assistant-fg) !important;
+      }
+      .chat-messages .message.user {
+        align-self: flex-end;
+        max-width: 78%;
+      }
+      .chat-messages .message.user .message-text {
+        display: block;
+        padding: 9px 12px;
+        border-radius: 16px;
+        border: 1px solid var(--oc-user-bubble-border);
+        background: var(--oc-user-bubble) !important;
+        color: #1e293b !important;
+        white-space: pre-wrap;
+        box-shadow: none;
+        transform-origin: bottom right;
+        animation: oc-user-bubble-appear 0.42s var(--oc-ease) both;
+      }
+      html.oc-dark .chat-messages .message.user .message-text,
+      html.oc-stealth .chat-messages .message.user .message-text {
+        color: #f1f5f9 !important;
+      }
+      .chat-messages .message.user.is-first .message-text {
+        animation-name: oc-user-bubble-rise;
+        animation-duration: 0.72s;
+      }
+      @keyframes oc-user-bubble-appear {
+        from { opacity: 0; transform: translateY(8px) scale(0.96); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
+      }
+      @keyframes oc-user-bubble-rise {
+        0% { opacity: 0; transform: translateY(36px) scale(0.94); filter: blur(6px); }
+        55% { opacity: 1; transform: translateY(-2px) scale(1.01); filter: blur(0); }
+        100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+      }
+      .chat-messages .message.assistant,
+      .chat-messages .message.system,
+      .chat-messages .message.transcription {
+        align-self: stretch;
+        max-width: 100%;
+        padding: 2px 2px 0;
+      }
+      .chat-messages .message.assistant .message-text,
+      .chat-messages .message.system .message-text {
+        color: var(--oc-assistant-fg) !important;
+        font-size: 13px;
+        line-height: 1.55;
+        white-space: normal;
+        animation: oc-assistant-print 0.38s var(--oc-ease) both;
+      }
+      @keyframes oc-assistant-print {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: none; }
+      }
+      .chat-messages .message.error {
+        align-self: stretch;
+        color: #b91c1c !important;
+      }
+      .chat-messages .message-time {
+        display: none; /* match chat tool — no timestamp chrome */
+      }
+      .chat-messages .message-text code {
+        background: rgba(15, 23, 42, 0.06) !important;
+        color: inherit !important;
+        padding: 1px 4px;
+        border-radius: 4px;
+        font-size: 11.5px;
+      }
+      html.oc-dark .chat-messages .message-text code,
+      html.oc-stealth .chat-messages .message-text code {
+        background: rgba(148, 163, 184, 0.16) !important;
+      }
+      .thinking-row {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 2px;
+        color: var(--oc-hint);
+        font-size: 12px;
+        font-weight: 550;
+      }
+      .thinking-dots .dot {
+        display: inline-block;
+        animation: oc-pulse 1.1s ease-in-out infinite;
+        margin-right: 2px;
+        color: var(--oc-glow);
+      }
+      .thinking-dots .dot:nth-child(2) { animation-delay: 0.15s; }
+      .thinking-dots .dot:nth-child(3) { animation-delay: 0.3s; }
+      @keyframes oc-pulse {
+        0%, 100% { opacity: 0.35; transform: translateY(0); }
+        50% { opacity: 1; transform: translateY(-1px); }
+      }
+
+      /* Scaled-down Clyra chat composer (no command palette) */
+      .chat-input-row {
+        display: flex;
+        gap: 0;
+        padding: 8px 12px 12px;
+        border-top: 1px solid var(--oc-border);
+        align-items: stretch;
+      }
+      .oc-composer {
+        flex: 1;
+        display: flex;
+        align-items: flex-end;
+        gap: 8px;
+        min-height: 44px;
+        padding: 6px 7px 6px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--oc-input-border);
+        background: var(--oc-input-bg);
+        box-shadow: 0 6px 18px rgba(24, 33, 47, 0.06);
+        transition: border-color 180ms ease, box-shadow 180ms ease, border-radius 220ms var(--oc-ease);
+      }
+      .oc-composer:focus-within {
+        border-radius: 20px;
+        border-color: color-mix(in srgb, var(--oc-input-border) 55%, #94a3b8 45%);
+        box-shadow: 0 0 0 3px rgba(73, 106, 149, 0.10), 0 6px 18px rgba(24, 33, 47, 0.06);
+      }
+      html.oc-dark .oc-composer:focus-within,
+      html.oc-stealth .oc-composer:focus-within {
+        box-shadow: 0 0 0 3px rgba(125, 211, 252, 0.12), 0 6px 18px rgba(0, 0, 0, 0.25);
+      }
+      #barChatInput {
+        flex: 1;
+        resize: none;
+        min-height: 28px;
+        max-height: 88px;
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        color: var(--oc-text-strong);
+        padding: 6px 0;
+        font-size: 13px;
+        line-height: 1.45;
+        font-family: inherit;
+        outline: none;
+        box-shadow: none;
+      }
+      #barChatInput::placeholder { color: var(--oc-hint); }
+      #barChatSend {
+        width: 32px;
+        height: 32px;
+        border-radius: 999px;
+        border: none;
+        background: #1e293b;
+        color: #fff;
+        cursor: pointer;
+        display: grid;
+        place-items: center;
+        flex-shrink: 0;
+        transition: transform 180ms var(--oc-ease), background 180ms ease, opacity 180ms ease;
+      }
+      html.oc-dark #barChatSend,
+      html.oc-stealth #barChatSend { background: #e2e8f0; color: #0f172a; }
+      #barChatSend:hover { transform: scale(1.06); }
+      #barChatSend:active { transform: scale(0.96); }
+      #barChatSend svg { width: 14px; height: 14px; transition: transform 220ms var(--oc-ease); }
+      #barChatSend:hover svg { transform: translateY(-1px); }
+
+      .oc-shell.is-task-prompt {
+        /* Legacy class kept for chevron; compose uses is-control-compose */
+      }
+      .oc-shell.is-control-compose .oc-actions,
+      .oc-shell.is-control-compose .oc-stealth-wrap,
+      .oc-shell.is-control-compose .oc-drag {
+        display: none !important;
+      }
+      .oc-shell.is-control-compose .oc-inline-control {
+        display: flex;
+      }
+      .oc-inline-control {
+        display: none;
+        flex: 1;
+        min-width: 0;
+        align-items: center;
+        gap: 8px;
+        -webkit-app-region: no-drag;
+      }
+      .oc-inline-control input {
+        flex: 1;
+        min-width: 0;
+        height: 36px;
+        border: none;
+        outline: none;
+        background: transparent;
+        color: var(--oc-text-strong);
+        font-size: 14px;
+        font-weight: 500;
+        letter-spacing: -0.01em;
+        padding: 0 4px;
+      }
+      .oc-inline-control input::placeholder {
+        color: #8b95a5;
+        font-weight: 450;
+      }
+      .oc-control-status {
+        display: none;
+        flex: 1;
+        min-width: 0;
+        color: var(--oc-text);
+        font-size: 13px;
+        font-weight: 550;
+        letter-spacing: -0.01em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        padding: 0 6px;
+        -webkit-app-region: no-drag;
+      }
+      .oc-shell.is-controlling .oc-control-status { display: block; }
+      .oc-shell.is-controlling .oc-actions .oc-pill-btn:not(#ocControlBtn) { display: none !important; }
+      .oc-shell.is-controlling .oc-stealth-wrap,
+      .oc-shell.is-controlling .oc-drag,
+      .oc-shell.is-controlling .oc-inline-control {
+        display: none !important;
+      }
+      .oc-shell.is-controlling .oc-actions {
+        margin-left: auto;
+      }
+      .oc-shell.is-shaking { animation: oc-shake 480ms var(--oc-ease); }
+      @keyframes oc-shake {
+        0%, 100% { transform: translateX(0); }
+        20% { transform: translateX(-6px); }
+        40% { transform: translateX(6px); }
+        60% { transform: translateX(-4px); }
+        80% { transform: translateX(3px); }
+      }
+      .oc-shell.is-fading-out {
+        opacity: 0;
+        transform: translateY(-6px) scale(0.985);
+        transition: opacity 360ms var(--oc-ease-soft), transform 360ms var(--oc-ease);
+      }
+      .oc-shell.is-fading-in {
+        opacity: 1;
+        transform: none;
+        transition: opacity 360ms var(--oc-ease-soft), transform 360ms var(--oc-ease);
+      }
+      .oc-shell.is-animating {
+        will-change: width, transform, opacity, height;
+      }
+    </style>
+  </head>
+  <body data-oc-light-bar="1">
+    <div class="oc-shell is-boot-squish" id="ocShell">
+      <div class="command-tab" id="commandTab">
+        <button type="button" class="oc-close oc-boot-hide" id="ocCloseBtn" title="Close" aria-label="Close">
+          <svg class="oc-icon-x" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+            <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+          <svg class="oc-icon-chevron" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+            <path d="M2 4 L6 8.2 L10 4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+
+        <div class="oc-inline-control" id="ocInlineControl">
+          <input id="ocInlineControlInput" type="text" autocomplete="off" spellcheck="true" placeholder="What should the AI do on your computer?" />
+        </div>
+        <div class="oc-control-status" id="ocControlStatus" aria-live="polite"></div>
+
+        <div class="oc-actions">
+          <button type="button" class="oc-pill-btn oc-boot-hide" id="ocAskBtn">
+            <svg class="oc-btn-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <defs>
+                <linearGradient id="ocSparkle" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stop-color="#3b82f6"/>
+                  <stop offset="55%" stop-color="#3b82f6"/>
+                  <stop offset="100%" stop-color="#93c5fd"/>
+                </linearGradient>
+              </defs>
+              <path fill="url(#ocSparkle)" d="M8 1.2l1.15 3.55L12.8 6 9.15 7.25 8 10.8 6.85 7.25 3.2 6l3.65-1.25L8 1.2z"/>
+              <path fill="url(#ocSparkle)" d="M12.6 9.1l.55 1.7 1.7.55-1.7.55-.55 1.7-.55-1.7-1.7-.55 1.7-.55.55-1.7z" opacity=".9"/>
+            </svg>
+            <span class="oc-btn-label">Ask</span>
+          </button>
+
+          <button type="button" class="oc-pill-btn oc-boot-hide" id="ocAutoBtn">
+            <svg class="oc-btn-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <defs>
+                <linearGradient id="ocBrain" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stop-color="#3b82f6"/>
+                  <stop offset="100%" stop-color="#2563eb"/>
+                </linearGradient>
+              </defs>
+              <path fill="none" stroke="url(#ocBrain)" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"
+                d="M5.2 4.2c-.9.3-1.6 1.2-1.6 2.3 0 .5.1.9.4 1.3C3.4 8.2 3 9 3 9.9c0 1.3 1 2.3 2.3 2.3h5.4c1.3 0 2.3-1 2.3-2.3 0-.9-.4-1.7-1-2.1.3-.4.4-.8.4-1.3 0-1.1-.7-2-1.6-2.3-.3-1-1.2-1.7-2.3-1.7S5.5 3.2 5.2 4.2z"/>
+              <path stroke="url(#ocBrain)" stroke-width="1.1" stroke-linecap="round" d="M8 5.2v5.2M6.1 6.4h3.8M6.1 8.2h3.8M6.4 10h3.2"/>
+            </svg>
+            <span class="oc-btn-label">Auto Answer</span>
+          </button>
+
+          <button type="button" class="oc-pill-btn oc-control oc-boot-hide" id="ocControlBtn" title="Let OpenCluely control your machine">
+            <svg class="oc-btn-icon oc-icon-control" viewBox="0 0 16 16" aria-hidden="true">
+              <defs>
+                <linearGradient id="ocTarget" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stop-color="#3b82f6"/>
+                  <stop offset="55%" stop-color="#3b82f6"/>
+                  <stop offset="100%" stop-color="#93c5fd"/>
+                </linearGradient>
+              </defs>
+              <circle cx="8" cy="8" r="5.4" fill="none" stroke="url(#ocTarget)" stroke-width="1.4"/>
+              <circle cx="8" cy="8" r="3.1" fill="none" stroke="url(#ocTarget)" stroke-width="1.3"/>
+              <circle cx="8" cy="8" r="1.15" fill="url(#ocTarget)"/>
+              <path d="M11.8 3.4l.55 1.15 1.15.35-1.15.35-.55 1.15-.35-1.15-1.15-.35 1.15-.35.35-1.15z" fill="url(#ocTarget)"/>
+            </svg>
+            <svg class="oc-btn-icon oc-icon-stop" viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="4.2" y="4.2" width="7.6" height="7.6" rx="1.4" fill="#fff"/>
+            </svg>
+            <span class="oc-btn-label oc-label-control">Take Control</span>
+            <span class="oc-btn-label oc-label-stop">Stop</span>
+          </button>
+        </div>
+
+        <div class="oc-trailing">
+          <div class="oc-stealth-wrap oc-boot-hide" id="ocStealthWrap" title="Hide OpenCluely from screen shares & Zoom">
+            <span class="oc-stealth-label">Stealth</span>
+            <button type="button" class="oc-stealth-switch" id="ocStealthSwitch" role="switch" aria-checked="false" aria-label="Stealth mode"></button>
+          </div>
+          <button type="button" class="oc-drag oc-boot-hide" id="ocDragHandle" title="Drag to move" aria-label="Drag bar">
+            <span class="oc-drag-dots" aria-hidden="true">
+              <span></span><span></span>
+              <span></span><span></span>
+              <span></span><span></span>
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="chat-drawer" id="chatDrawer" aria-hidden="true">
+        <div class="chat-drawer-inner">
+          <div class="chat-drawer-header">
+            <span id="chatModeLabel">Ask</span>
+            <span class="hint" id="chatModeHint">Type a question…</span>
+          </div>
+          <div class="chat-messages" id="barChatMessages"></div>
+          <div class="chat-input-row">
+            <div class="oc-composer" data-composer="1">
+              <textarea id="barChatInput" rows="1" placeholder="Ask Clyra anything…"></textarea>
+              <button type="button" id="barChatSend" title="Send" aria-label="Send">
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 19V5M12 5l-6 6M12 5l6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="./src/ui/bar-chat.js"></script>
+  </body>
+</html>

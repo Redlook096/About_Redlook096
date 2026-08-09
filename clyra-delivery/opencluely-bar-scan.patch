@@ -1,0 +1,2468 @@
+From 471a2c5a379eee3ab2cb560f75dc2a150d79fbd4 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 9 Aug 2026 05:17:13 +0000
+Subject: [PATCH 1/2] Add Visual Intelligence Scan system for Clyra and
+ OpenCluely
+
+- Native macOS Swift overlay (AXUIElement + ScreenCaptureKit + Core Animation)
+- Electron visual-scan-manager with transparent canvas fallback for Linux/non-darwin
+- Safe IPC API: start/stop/isAvailable/permissionState/setQuality
+- Wire into Clyra main/preload and OpenCluely screenshot OCR / Auto Answer paths
+- Fire-and-forget scan returns within ~50ms; ~1.65s icy radial animation
+---
+ electron/main.mjs                             |  25 ++
+ electron/preload.cjs                          |   7 +
+ electron/visual-scan-manager.mjs              | 402 ++++++++++++++++++
+ electron/visual-scan-overlay.html             | 134 ++++++
+ native/visual-scan/Package.swift              |  16 +
+ .../Sources/VisualScan/OverlayPanel.swift     |  48 +++
+ .../Sources/VisualScan/ScanAnimation.swift    | 148 +++++++
+ .../VisualScan/SceneGeometryCache.swift       | 145 +++++++
+ .../Sources/VisualScan/SceneModels.swift      |  79 ++++
+ .../Sources/VisualScan/VisualScanCLI.swift    | 106 +++++
+ .../visual-scan/Sources/VisualScan/main.swift |  14 +
+ scripts/clone-opencluely.sh                   |   1 +
+ scripts/opencluely-bridge/main.js             |   9 +
+ scripts/opencluely-bridge/preload.js          |   9 +
+ .../opencluely-bridge/visual-scan-bridge.js   |  56 +++
+ src/lib/electron-runtime.ts                   |   7 +
+ tools/visual-scan-smoke.mjs                   |  34 ++
+ 17 files changed, 1240 insertions(+)
+ create mode 100644 electron/visual-scan-manager.mjs
+ create mode 100644 electron/visual-scan-overlay.html
+ create mode 100644 native/visual-scan/Package.swift
+ create mode 100644 native/visual-scan/Sources/VisualScan/OverlayPanel.swift
+ create mode 100644 native/visual-scan/Sources/VisualScan/ScanAnimation.swift
+ create mode 100644 native/visual-scan/Sources/VisualScan/SceneGeometryCache.swift
+ create mode 100644 native/visual-scan/Sources/VisualScan/SceneModels.swift
+ create mode 100644 native/visual-scan/Sources/VisualScan/VisualScanCLI.swift
+ create mode 100644 native/visual-scan/Sources/VisualScan/main.swift
+ create mode 100644 scripts/opencluely-bridge/visual-scan-bridge.js
+ create mode 100644 tools/visual-scan-smoke.mjs
+
+diff --git a/electron/main.mjs b/electron/main.mjs
+index 3bc0dd6..9db290d 100644
+--- a/electron/main.mjs
++++ b/electron/main.mjs
+@@ -17,6 +17,7 @@ import { LocalMemoryManager } from "./local-memory-manager.mjs";
+ import { ScreenCaptureService } from "./screen-capture.mjs";
+ import { DesktopControlService } from "./desktop-control.mjs";
+ import { CompanionManager } from "./companion-manager.mjs";
++import { getVisualScanManager } from "./visual-scan-manager.mjs";
+ 
+ const execFileAsync = promisify(execFile);
+ 
+@@ -57,6 +58,7 @@ let localMemoryManager = null;
+ let companionManager = null;
+ let screenCaptureService = null;
+ let desktopControlService = null;
++let visualScanManager = null;
+ let serviceProcess = null;
+ let opencluelyProcess = null;
+ let opencluelyStartPromise = null;
+@@ -79,6 +81,7 @@ function destroyNativeManagers() {
+   try { dictationManager?.destroy(); } catch (error) { console.warn("[dictation] teardown failed:", error); }
+   try { smartToolbarManager?.destroy(); } catch (error) { console.warn("[smart-toolbar] teardown failed:", error); }
+   try { companionManager?.destroy(); } catch (error) { console.warn("[companion] teardown failed:", error); }
++  try { void visualScanManager?.stop(); } catch (error) { console.warn("[visual-scan] teardown failed:", error); }
+   dictationManager = null;
+   smartToolbarManager = null;
+   companionManager = null;
+@@ -909,6 +912,27 @@ function registerIpc() {
+     authorize(event);
+     return toggleOpenCluelyOverlay();
+   });
++  ipcMain.handle("visual-scan:start", async (event, payload = {}) => {
++    authorize(event);
++    return visualScanManager?.start(payload || {}) || { ok: false, error: "Visual scan unavailable." };
++  });
++  ipcMain.handle("visual-scan:stop", async (event) => {
++    authorize(event);
++    return visualScanManager?.stop() || { ok: false, error: "Visual scan unavailable." };
++  });
++  ipcMain.handle("visual-scan:is-available", async (event) => {
++    authorize(event);
++    return { ok: true, available: Boolean(visualScanManager?.isAvailable()) };
++  });
++  ipcMain.handle("visual-scan:permission-state", async (event) => {
++    authorize(event);
++    return visualScanManager?.permissionState() || { ok: false, error: "Visual scan unavailable." };
++  });
++  ipcMain.handle("visual-scan:set-quality", async (event, payload = {}) => {
++    authorize(event);
++    return visualScanManager?.setQuality(payload?.quality) || { ok: false, error: "Visual scan unavailable." };
++  });
++
+   ipcMain.handle("opencluely:status", async (event) => {
+     authorize(event);
+     const health = await getOpenCluelyHealth();
+@@ -1028,6 +1052,7 @@ async function createWindow() {
+   localMemoryManager = new LocalMemoryManager({ filePath:path.join(app.getPath("userData"), "clyra-memory.dat"), development:isDevelopment });
+   screenCaptureService = new ScreenCaptureService();
+   desktopControlService = new DesktopControlService();
++  visualScanManager = getVisualScanManager({ projectRoot });
+   companionManager = new CompanionManager({
+     preloadPath: path.join(here, "companion-preload.cjs"),
+     htmlPath: path.join(here, "companion.html"),
+diff --git a/electron/preload.cjs b/electron/preload.cjs
+index cdec085..f9a242f 100644
+--- a/electron/preload.cjs
++++ b/electron/preload.cjs
+@@ -57,6 +57,13 @@ contextBridge.exposeInMainWorld("clyraDesktop", {
+     toggle: () => ipcRenderer.invoke("opencluely:toggle"),
+     status: () => ipcRenderer.invoke("opencluely:status"),
+   },
++  visualScan: {
++    start: (payload) => ipcRenderer.invoke("visual-scan:start", payload || {}),
++    stop: () => ipcRenderer.invoke("visual-scan:stop"),
++    isAvailable: () => ipcRenderer.invoke("visual-scan:is-available"),
++    permissionState: () => ipcRenderer.invoke("visual-scan:permission-state"),
++    setQuality: (quality) => ipcRenderer.invoke("visual-scan:set-quality", { quality }),
++  },
+   seeScreen: (question) => ipcRenderer.invoke("desktop:see-screen", { question }),
+   google: {
+     status: () => ipcRenderer.invoke("google:status"),
+diff --git a/electron/visual-scan-manager.mjs b/electron/visual-scan-manager.mjs
+new file mode 100644
+index 0000000..be5b190
+--- /dev/null
++++ b/electron/visual-scan-manager.mjs
+@@ -0,0 +1,402 @@
++/**
++ * Visual Intelligence Scan — Electron main-process bridge.
++ * macOS: spawns native visual-scan binary when available.
++ * Other platforms / missing binary: transparent canvas overlay via desktopCapturer geometry.
++ */
++import { BrowserWindow, desktopCapturer, screen, systemPreferences } from "electron";
++import { execFile, spawn } from "node:child_process";
++import { existsSync } from "node:fs";
++import path from "node:path";
++import { fileURLToPath, pathToFileURL } from "node:url";
++import { promisify } from "node:util";
++
++const execFileAsync = promisify(execFile);
++const SCAN_DURATION_MS = 1650;
++const START_BUDGET_MS = 50;
++
++const here = path.dirname(fileURLToPath(import.meta.url));
++
++export class VisualScanManager {
++  /**
++   * @param {{ projectRoot?: string }} [options]
++   */
++  constructor(options = {}) {
++    this.projectRoot = options.projectRoot || path.resolve(here, "..");
++    this.quality = "high";
++    this.active = false;
++    this.overlayWindows = [];
++    this.nativeChild = null;
++    this.stopTimer = null;
++  }
++
++  isAvailable() {
++    if (process.platform === "darwin") {
++      return existsSync(this.#nativeBinaryPath());
++    }
++    return true;
++  }
++
++  permissionState() {
++    if (process.platform === "darwin") {
++      const accessibility = systemPreferences.isTrustedAccessibilityClient(false);
++      const screenCapture = systemPreferences.getMediaAccessStatus("screen") === "granted";
++      let mode = "minimalWave";
++      if (accessibility) mode = "fullAX";
++      else if (screenCapture) mode = "windowOnly";
++      return {
++        ok: true,
++        platform: "darwin",
++        accessibility,
++        screenCapture,
++        mode,
++        nativeBinary: existsSync(this.#nativeBinaryPath()),
++      };
++    }
++    return {
++      ok: true,
++      platform: process.platform,
++      accessibility: false,
++      screenCapture: true,
++      mode: "electronFallback",
++      nativeBinary: false,
++    };
++  }
++
++  setQuality(quality = "high") {
++    const normalized = String(quality || "high").toLowerCase();
++    this.quality = ["low", "medium", "high"].includes(normalized) ? normalized : "high";
++    return { ok: true, quality: this.quality };
++  }
++
++  /**
++   * Fire-and-forget scan animation. Returns within ~50ms; animation continues in background.
++   * @param {{ displayId?: number, quality?: string }} [options]
++   */
++  async start(options = {}) {
++    if (this.active) return { ok: true, alreadyRunning: true };
++    this.active = true;
++    const quality = options.quality || this.quality;
++    const started = Date.now();
++
++    const run = async () => {
++      try {
++        if (process.platform === "darwin" && existsSync(this.#nativeBinaryPath())) {
++          await this.#startNative({ quality });
++        } else {
++          await this.#startElectronOverlay({ displayId: options.displayId, quality });
++        }
++      } catch (error) {
++        this.active = false;
++        console.warn("[visual-scan] start failed:", error instanceof Error ? error.message : error);
++      }
++    };
++
++    void run();
++
++    const elapsed = Date.now() - started;
++    if (elapsed < START_BUDGET_MS) {
++      await new Promise((resolve) => setTimeout(resolve, START_BUDGET_MS - elapsed));
++    }
++
++    return {
++      ok: true,
++      backend: process.platform === "darwin" && existsSync(this.#nativeBinaryPath()) ? "native" : "electron",
++      startedMs: Date.now() - started,
++    };
++  }
++
++  async stop() {
++    if (this.stopTimer) {
++      clearTimeout(this.stopTimer);
++      this.stopTimer = null;
++    }
++    if (this.nativeChild && !this.nativeChild.killed) {
++      try {
++        this.nativeChild.kill("SIGTERM");
++      } catch {
++        /* ignore */
++      }
++      this.nativeChild = null;
++    }
++    for (const win of this.overlayWindows) {
++      try {
++        if (win && !win.isDestroyed()) win.close();
++      } catch {
++        /* ignore */
++      }
++    }
++    this.overlayWindows = [];
++    this.active = false;
++    return { ok: true };
++  }
++
++  #nativeBinaryPath() {
++    const candidates = [
++      path.join(this.projectRoot, "native", "visual-scan", ".build", "release", "visual-scan"),
++      path.join(this.projectRoot, "native", "visual-scan", ".build", "debug", "visual-scan"),
++      path.join(process.resourcesPath || "", "native", "visual-scan", "visual-scan"),
++    ];
++    return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
++  }
++
++  async #startNative({ quality }) {
++    const scene = await this.#buildScene({ quality });
++    const binary = this.#nativeBinaryPath();
++    const child = spawn(binary, ["start", "--quality", quality], {
++      stdio: ["pipe", "ignore", "ignore"],
++      detached: false,
++    });
++    this.nativeChild = child;
++    child.stdin.write(JSON.stringify(scene));
++    child.stdin.end();
++
++    const budget = Math.max(0, START_BUDGET_MS - 5);
++    await Promise.race([
++      new Promise((resolve) => setTimeout(resolve, budget)),
++      new Promise((resolve) => child.once("spawn", resolve)),
++    ]);
++
++    child.on("exit", () => {
++      if (this.nativeChild === child) this.nativeChild = null;
++      this.active = false;
++    });
++
++    this.stopTimer = setTimeout(() => {
++      void this.stop();
++    }, SCAN_DURATION_MS + 400);
++  }
++
++  async #startElectronOverlay({ displayId, quality }) {
++    const scene = await this.#buildScene({ displayId, quality });
++    const display = scene.display;
++    const overlayPath = path.join(here, "visual-scan-overlay.html");
++    const sceneParam = encodeURIComponent(JSON.stringify(scene));
++    const url = `${pathToFileURL(overlayPath).href}?scene=${sceneParam}`;
++
++    const win = new BrowserWindow({
++      x: Math.round(display.x),
++      y: Math.round(display.y),
++      width: Math.round(display.width),
++      height: Math.round(display.height),
++      frame: false,
++      transparent: true,
++      resizable: false,
++      movable: false,
++      focusable: false,
++      skipTaskbar: true,
++      alwaysOnTop: true,
++      hasShadow: false,
++      show: false,
++      webPreferences: {
++        nodeIntegration: false,
++        contextIsolation: true,
++        backgroundThrottling: false,
++      },
++    });
++
++    win.setIgnoreMouseEvents(true, { forward: true });
++    win.setAlwaysOnTop(true, "screen-saver");
++    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
++    this.overlayWindows.push(win);
++
++    const loadPromise = win.loadURL(url);
++    await Promise.race([
++      loadPromise.catch(() => undefined),
++      new Promise((resolve) => setTimeout(resolve, 120)),
++    ]);
++    if (!win.isDestroyed()) win.showInactive();
++
++    this.stopTimer = setTimeout(() => {
++      void this.stop();
++    }, SCAN_DURATION_MS + 250);
++
++    win.on("closed", () => {
++      this.overlayWindows = this.overlayWindows.filter((w) => w !== win);
++      if (!this.overlayWindows.length && !this.nativeChild) this.active = false;
++    });
++  }
++
++  async #buildScene({ displayId, quality = "high" }) {
++    const cap = quality === "low" ? 40 : quality === "medium" ? 80 : 120;
++    const target = this.#targetDisplay(displayId);
++    const reduceMotion = this.#prefersReducedMotion();
++    let contours = [];
++
++    try {
++      const sources = await desktopCapturer.getSources({
++        types: ["window", "screen"],
++        thumbnailSize: { width: 320, height: 200 },
++        fetchWindowIcons: false,
++      });
++
++      const selfNames = /clyra|opencluely|visual scan|live transcription|ai response/i;
++      const windowSources = sources.filter((s) => s.id.startsWith("window:") && !selfNames.test(s.name || ""));
++      const linuxWindows = process.platform === "linux" ? await this.#linuxWindowGeometry() : [];
++
++      for (const source of windowSources) {
++        const match = linuxWindows.find((w) => this.#namesClose(w.title, source.name));
++        if (match) {
++          contours.push({ x: match.x, y: match.y, width: match.width, height: match.height });
++          continue;
++        }
++        const thumb = source.thumbnail?.getSize?.() || { width: 0, height: 0 };
++        if (thumb.width < 40 || thumb.height < 24) continue;
++        const width = Math.min(thumb.width * 2, target.bounds.width * 0.92);
++        const height = Math.min(thumb.height * 2, target.bounds.height * 0.88);
++        const x = target.bounds.x + (target.bounds.width - width) / 2;
++        const y = target.bounds.y + (target.bounds.height - height) / 2;
++        contours.push({ x, y, width, height });
++      }
++
++      if (!contours.length) {
++        contours.push({
++          x: target.bounds.x + target.bounds.width * 0.06,
++          y: target.bounds.y + target.bounds.height * 0.06,
++          width: target.bounds.width * 0.88,
++          height: target.bounds.height * 0.88,
++        });
++      }
++    } catch {
++      /* geometry probe failed — fall back to minimal frame */
++    }
++
++    if (contours.length < 8) {
++      contours.push(...this.#minimalContours(target.bounds));
++    }
++
++    contours = this.#filterContours(contours, target.bounds, cap);
++
++    return {
++      display: {
++        x: target.bounds.x,
++        y: target.bounds.y,
++        width: target.bounds.width,
++        height: target.bounds.height,
++      },
++      contours,
++      quality,
++      reduceMotion,
++      permissionMode: this.permissionState().mode,
++    };
++  }
++
++  #targetDisplay(displayId) {
++    const displays = screen.getAllDisplays();
++    if (displayId != null) {
++      const match = displays.find((d) => d.id === displayId);
++      if (match) return match;
++    }
++    return screen.getPrimaryDisplay();
++  }
++
++  #prefersReducedMotion() {
++    return false;
++  }
++
++  #minimalContours(bounds) {
++    const inset = Math.min(bounds.width, bounds.height) * 0.08;
++    const x = bounds.x + inset;
++    const y = bounds.y + inset;
++    const w = bounds.width - inset * 2;
++    const h = bounds.height - inset * 2;
++    return [
++      { x, y, width: w, height: h },
++      { x, y, width: w, height: 2 },
++      { x, y: y + h - 2, width: w, height: 2 },
++      { x, y, width: 2, height: h },
++      { x: x + w - 2, y, width: 2, height: h },
++    ];
++  }
++
++  #filterContours(contours, bounds, cap) {
++    const minArea = Math.max(900, bounds.width * bounds.height * 0.00015);
++    const seen = new Set();
++    const out = [];
++    for (const rect of contours
++      .filter((r) => r.width >= 24 && r.height >= 12 && r.width * r.height >= minArea)
++      .sort((a, b) => b.width * b.height - a.width * a.height)) {
++      const key = `${Math.round(rect.x)}:${Math.round(rect.y)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
++      if (seen.has(key)) continue;
++      seen.add(key);
++      out.push(rect);
++      if (out.length >= cap) break;
++    }
++    return out;
++  }
++
++  async #linuxWindowGeometry() {
++    const display = process.env.DISPLAY || ":0";
++    const env = { ...process.env, DISPLAY: display };
++    try {
++      const { stdout } = await execFileAsync("xdotool", ["search", "--name", "."], {
++        timeout: 4000,
++        env,
++        encoding: "utf8",
++      });
++      const ids = String(stdout || "")
++        .trim()
++        .split(/\s+/)
++        .filter(Boolean)
++        .slice(0, 80);
++      const windows = [];
++      for (const id of ids) {
++        try {
++          const { stdout: geom } = await execFileAsync("xdotool", ["getwindowgeometry", "--shell", id], {
++            timeout: 1500,
++            env,
++            encoding: "utf8",
++          });
++          const vals = Object.fromEntries(
++            String(geom || "")
++              .trim()
++              .split("\n")
++              .map((line) => line.split("="))
++              .filter((p) => p.length === 2),
++          );
++          const title = await execFileAsync("xdotool", ["getwindowname", id], { timeout: 1500, env, encoding: "utf8" })
++            .then((r) => String(r.stdout || "").trim())
++            .catch(() => "");
++          if (/clyra|opencluely/i.test(title)) continue;
++          windows.push({
++            id,
++            title,
++            x: Number(vals.X) || 0,
++            y: Number(vals.Y) || 0,
++            width: Number(vals.WIDTH) || 0,
++            height: Number(vals.HEIGHT) || 0,
++          });
++        } catch {
++          /* skip window */
++        }
++      }
++      return windows.filter((w) => w.width >= 200 && w.height >= 120);
++    } catch {
++      return [];
++    }
++  }
++
++  #namesClose(a = "", b = "") {
++    const left = String(a).toLowerCase().trim();
++    const right = String(b).toLowerCase().trim();
++    if (!left || !right) return false;
++    return left.includes(right) || right.includes(left);
++  }
++}
++
++let singleton = null;
++
++/**
++ * @param {{ projectRoot?: string }} [options]
++ */
++export function getVisualScanManager(options = {}) {
++  if (!singleton) singleton = new VisualScanManager(options);
++  return singleton;
++}
++
++/**
++ * Fire-and-forget helper for OpenCluely bridge (CJS-friendly dynamic import target).
++ */
++export async function fireVisualScan(options = {}) {
++  const manager = getVisualScanManager(options);
++  return manager.start(options);
++}
+diff --git a/electron/visual-scan-overlay.html b/electron/visual-scan-overlay.html
+new file mode 100644
+index 0000000..a6e4ab5
+--- /dev/null
++++ b/electron/visual-scan-overlay.html
+@@ -0,0 +1,134 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8" />
++  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++  <title>Visual Scan</title>
++  <style>
++    html, body {
++      margin: 0;
++      width: 100%;
++      height: 100%;
++      overflow: hidden;
++      background: transparent;
++      pointer-events: none;
++    }
++    canvas {
++      display: block;
++      width: 100%;
++      height: 100%;
++    }
++  </style>
++</head>
++<body>
++  <canvas id="scan"></canvas>
++  <script>
++    const DURATION_MS = 1650;
++    const ICE = "rgba(224, 236, 248, ";
++    const WAVE = "rgba(242, 248, 255, ";
++
++    function easeOutCubic(t) {
++      return 1 - Math.pow(1 - t, 3);
++    }
++
++    function drawRoundedRect(ctx, x, y, w, h, r) {
++      const radius = Math.min(r, w / 2, h / 2);
++      ctx.beginPath();
++      ctx.moveTo(x + radius, y);
++      ctx.lineTo(x + w - radius, y);
++      ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
++      ctx.lineTo(x + w, y + h - radius);
++      ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
++      ctx.lineTo(x + radius, y + h);
++      ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
++      ctx.lineTo(x, y + radius);
++      ctx.quadraticCurveTo(x, y, x + radius, y);
++      ctx.closePath();
++    }
++
++    function startScan(scene) {
++      const canvas = document.getElementById("scan");
++      const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
++      const dpr = window.devicePixelRatio || 1;
++      const width = Math.max(1, Math.round(scene.display.width));
++      const height = Math.max(1, Math.round(scene.display.height));
++      canvas.width = Math.round(width * dpr);
++      canvas.height = Math.round(height * dpr);
++      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
++
++      const center = { x: width / 2, y: height / 2 };
++      const maxRadius = Math.hypot(width, height) * 0.55;
++      const contours = (scene.contours || []).map((r) => ({
++        x: r.x - scene.display.x,
++        y: r.y - scene.display.y,
++        width: r.width,
++        height: r.height,
++        dist: Math.hypot(r.x + r.width / 2 - scene.display.x - center.x, r.y + r.height / 2 - scene.display.y - center.y),
++      }));
++      const maxDist = Math.max(1, ...contours.map((c) => c.dist), 1);
++      const reduceMotion = Boolean(scene.reduceMotion);
++
++      const started = performance.now();
++      let raf = 0;
++
++      function frame(now) {
++        const elapsed = now - started;
++        const t = Math.min(1, elapsed / DURATION_MS);
++        ctx.clearRect(0, 0, width, height);
++
++        if (reduceMotion) {
++          const pulse = Math.sin((elapsed / DURATION_MS) * Math.PI) * 0.28;
++          ctx.fillStyle = WAVE + pulse + ")";
++          ctx.fillRect(0, 0, width, height);
++        } else {
++          const waveT = easeOutCubic(Math.min(1, t / 0.82));
++          const radius = maxRadius * waveT;
++          const waveAlpha = 0.42 * (1 - Math.max(0, (t - 0.45) / 0.55));
++          if (waveAlpha > 0.01) {
++            ctx.beginPath();
++            ctx.arc(center.x, center.y, Math.max(2, radius), 0, Math.PI * 2);
++            ctx.strokeStyle = WAVE + waveAlpha + ")";
++            ctx.lineWidth = 1.6;
++            ctx.stroke();
++          }
++
++          for (const rect of contours) {
++            const reveal = rect.dist / maxDist;
++            const localT = (t - reveal * 0.72) / 0.22;
++            if (localT <= 0) continue;
++            const alpha = Math.max(0, Math.min(0.72, localT) * (1 - Math.max(0, (t - 0.78) / 0.22)));
++            if (alpha <= 0.01) continue;
++            ctx.strokeStyle = ICE + alpha + ")";
++            ctx.lineWidth = 1.1;
++            drawRoundedRect(ctx, rect.x, rect.y, rect.width, rect.height, 3);
++            ctx.stroke();
++          }
++        }
++
++        if (t < 1) {
++          raf = requestAnimationFrame(frame);
++        } else {
++          ctx.clearRect(0, 0, width, height);
++          window.__scanDone = true;
++        }
++      }
++
++      raf = requestAnimationFrame(frame);
++      return () => cancelAnimationFrame(raf);
++    }
++
++    const params = new URLSearchParams(location.search);
++    const encoded = params.get("scene");
++    if (encoded) {
++      try {
++        startScan(JSON.parse(decodeURIComponent(encoded)));
++      } catch (error) {
++        console.error("visual-scan scene parse failed", error);
++        window.__scanDone = true;
++      }
++    } else {
++      window.__scanDone = true;
++    }
++  </script>
++</body>
++</html>
+diff --git a/native/visual-scan/Package.swift b/native/visual-scan/Package.swift
+new file mode 100644
+index 0000000..aec0453
+--- /dev/null
++++ b/native/visual-scan/Package.swift
+@@ -0,0 +1,16 @@
++// swift-tools-version: 5.9
++import PackageDescription
++
++let package = Package(
++    name: "visual-scan",
++    platforms: [.macOS(.v13)],
++    products: [
++        .executable(name: "visual-scan", targets: ["VisualScan"]),
++    ],
++    targets: [
++        .executableTarget(
++            name: "VisualScan",
++            path: "Sources/VisualScan"
++        ),
++    ]
++)
+diff --git a/native/visual-scan/Sources/VisualScan/OverlayPanel.swift b/native/visual-scan/Sources/VisualScan/OverlayPanel.swift
+new file mode 100644
+index 0000000..27377f9
+--- /dev/null
++++ b/native/visual-scan/Sources/VisualScan/OverlayPanel.swift
+@@ -0,0 +1,48 @@
++import AppKit
++
++final class OverlayPanel: NSPanel {
++    private let animationController: ScanAnimationController
++
++    init(scene: ScanScene) {
++        let display = scene.display.cgRect
++        let contours = scene.contours.map(\.cgRect)
++        let reduceMotion = scene.reduceMotion ?? NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
++        animationController = ScanAnimationController(
++            display: CGRect(origin: .zero, size: display.size),
++            contours: contours.map { CGRect(x: $0.origin.x - display.origin.x,
++                                           y: $0.origin.y - display.origin.y,
++                                           width: $0.width,
++                                           height: $0.height) },
++            reduceMotion: reduceMotion
++        )
++
++        super.init(
++            contentRect: display,
++            styleMask: [.borderless, .nonactivatingPanel],
++            backing: .buffered,
++            defer: false
++        )
++
++        isOpaque = false
++        backgroundColor = .clear
++        hasShadow = false
++        level = .screenSaver
++        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
++        ignoresMouseEvents = true
++        isReleasedWhenClosed = true
++        hidesOnDeactivate = false
++        becomesKeyOnlyIfNeeded = true
++
++        let content = NSView(frame: CGRect(origin: .zero, size: display.size))
++        content.wantsLayer = true
++        content.layer?.addSublayer(animationController.layer)
++        contentView = content
++    }
++
++    func runAnimation(completion: @escaping () -> Void) {
++        orderFrontRegardless()
++        animationController.start {
++            completion()
++        }
++    }
++}
+diff --git a/native/visual-scan/Sources/VisualScan/ScanAnimation.swift b/native/visual-scan/Sources/VisualScan/ScanAnimation.swift
+new file mode 100644
+index 0000000..cd8c8ec
+--- /dev/null
++++ b/native/visual-scan/Sources/VisualScan/ScanAnimation.swift
+@@ -0,0 +1,148 @@
++import AppKit
++import QuartzCore
++
++final class ScanAnimationController {
++    static let duration: TimeInterval = 1.65
++
++    private let rootLayer = CALayer()
++    private let waveLayer = CAShapeLayer()
++    private let contourLayers: [CAShapeLayer]
++    private let display: CGRect
++    private let contours: [CGRect]
++    private let reduceMotion: Bool
++    private var completion: (() -> Void)?
++
++    init(display: CGRect, contours: [CGRect], reduceMotion: Bool) {
++        self.display = display
++        self.contours = contours
++        self.reduceMotion = reduceMotion
++        self.contourLayers = contours.map { _ in CAShapeLayer() }
++        configureLayers()
++    }
++
++    var layer: CALayer { rootLayer }
++
++    private func configureLayers() {
++        rootLayer.frame = display
++        rootLayer.backgroundColor = NSColor.clear.cgColor
++
++        waveLayer.fillColor = NSColor.clear.cgColor
++        waveLayer.strokeColor = NSColor(calibratedWhite: 0.94, alpha: 0.55).cgColor
++        waveLayer.lineWidth = 1.4
++        waveLayer.lineCap = .round
++        waveLayer.lineJoin = .round
++        rootLayer.addSublayer(waveLayer)
++
++        for (index, layer) in contourLayers.enumerated() {
++            layer.fillColor = NSColor.clear.cgColor
++            layer.strokeColor = NSColor(calibratedRed: 0.82, green: 0.9, blue: 0.98, alpha: 0.0).cgColor
++            layer.lineWidth = 1.1
++            layer.lineCap = .round
++            layer.lineJoin = .round
++            layer.path = CGPath(roundedRect: contours[index], cornerWidth: 3, cornerHeight: 3, transform: nil)
++            rootLayer.addSublayer(layer)
++        }
++    }
++
++    func start(completion: @escaping () -> Void) {
++        self.completion = completion
++        if reduceMotion {
++            runReducedMotion(completion: completion)
++            return
++        }
++        runFullAnimation(completion: completion)
++    }
++
++    private func runReducedMotion(completion: @escaping () -> Void) {
++        let fade = CABasicAnimation(keyPath: "opacity")
++        fade.fromValue = 0.0
++        fade.toValue = 0.35
++        fade.duration = 0.35
++        fade.autoreverses = true
++        fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
++        rootLayer.opacity = 0
++        rootLayer.add(fade, forKey: "reduceMotion")
++        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
++            completion()
++        }
++    }
++
++    private func runFullAnimation(completion: @escaping () -> Void) {
++        let center = CGPoint(x: display.midX, y: display.midY)
++        let maxRadius = hypot(display.width, display.height) * 0.55
++
++        let wave = CAShapeLayer()
++        wave.fillColor = NSColor.clear.cgColor
++        wave.strokeColor = NSColor(calibratedWhite: 0.95, alpha: 0.42).cgColor
++        wave.lineWidth = 1.6
++        rootLayer.insertSublayer(wave, below: waveLayer)
++
++        let circlePath = CGMutablePath()
++        circlePath.addEllipse(in: CGRect(x: center.x - 1, y: center.y - 1, width: 2, height: 2))
++        wave.path = circlePath
++
++        let scale = CABasicAnimation(keyPath: "transform.scale")
++        scale.fromValue = 0.01
++        scale.toValue = maxRadius / 2.0
++        scale.duration = Self.duration * 0.82
++        scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
++
++        let opacity = CABasicAnimation(keyPath: "opacity")
++        opacity.fromValue = 0.55
++        opacity.toValue = 0.0
++        opacity.beginTime = Self.duration * 0.45
++        opacity.duration = Self.duration * 0.55
++        opacity.fillMode = .forwards
++        opacity.isRemovedOnCompletion = false
++
++        let group = CAAnimationGroup()
++        group.animations = [scale, opacity]
++        group.duration = Self.duration
++        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
++        wave.add(group, forKey: "radialWave")
++
++        let distances = contours.map { rect -> CGFloat in
++            let mid = CGPoint(x: rect.midX, y: rect.midY)
++            return hypot(mid.x - center.x, mid.y - center.y)
++        }
++        let maxDist = max(distances.max() ?? 1, 1)
++
++        for (index, layer) in contourLayers.enumerated() {
++            let delay = (distances[index] / maxDist) * Self.duration * 0.72
++            let stroke = CABasicAnimation(keyPath: "strokeColor")
++            stroke.fromValue = NSColor(calibratedRed: 0.82, green: 0.9, blue: 0.98, alpha: 0.0).cgColor
++            stroke.toValue = NSColor(calibratedRed: 0.88, green: 0.94, blue: 1.0, alpha: 0.72).cgColor
++            stroke.duration = 0.22
++            stroke.beginTime = delay
++            stroke.fillMode = .forwards
++            stroke.isRemovedOnCompletion = false
++
++            let fade = CABasicAnimation(keyPath: "opacity")
++            fade.fromValue = 1.0
++            fade.toValue = 0.0
++            fade.beginTime = delay + 0.35
++            fade.duration = Self.duration - (delay + 0.35)
++            fade.fillMode = .forwards
++            fade.isRemovedOnCompletion = false
++
++            let contourGroup = CAAnimationGroup()
++            contourGroup.animations = [stroke, fade]
++            contourGroup.duration = Self.duration
++            contourGroup.beginTime = CACurrentMediaTime()
++            layer.add(contourGroup, forKey: "trace")
++        }
++
++        let dissolve = CABasicAnimation(keyPath: "opacity")
++        dissolve.fromValue = 1.0
++        dissolve.toValue = 0.0
++        dissolve.beginTime = Self.duration * 0.78
++        dissolve.duration = Self.duration * 0.22
++        dissolve.fillMode = .forwards
++        dissolve.isRemovedOnCompletion = false
++        rootLayer.add(dissolve, forKey: "dissolve")
++
++        DispatchQueue.main.asyncAfter(deadline: .now() + Self.duration + 0.05) {
++            completion()
++        }
++    }
++}
+diff --git a/native/visual-scan/Sources/VisualScan/SceneGeometryCache.swift b/native/visual-scan/Sources/VisualScan/SceneGeometryCache.swift
+new file mode 100644
+index 0000000..8bd8a92
+--- /dev/null
++++ b/native/visual-scan/Sources/VisualScan/SceneGeometryCache.swift
+@@ -0,0 +1,145 @@
++import AppKit
++import ApplicationServices
++import CoreGraphics
++import ScreenCaptureKit
++
++enum SceneGeometryCache {
++    static func buildScene(quality: ScanQuality, reduceMotion: Bool) async -> ScanScene {
++        let display = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
++        let mode = permissionMode()
++        var contours: [SceneRect] = []
++
++        switch mode {
++        case .fullAX:
++            contours = await contoursFromAX(display: display, cap: quality.contourCap)
++            if contours.isEmpty {
++                contours = await contoursFromScreenCapture(display: display, cap: quality.contourCap)
++            }
++        case .windowOnly:
++            contours = await contoursFromScreenCapture(display: display, cap: quality.contourCap)
++        case .minimalWave:
++            contours = minimalContours(display: display)
++        }
++
++        contours = filterAndCap(contours, display: display, cap: quality.contourCap)
++
++        return ScanScene(
++            display: SceneDisplay(display),
++            contours: contours,
++            quality: quality.rawValue,
++            reduceMotion: reduceMotion,
++            permissionMode: mode.rawValue
++        )
++    }
++
++    static func permissionMode() -> PermissionMode {
++        let axTrusted = AXIsProcessTrusted()
++        if axTrusted { return .fullAX }
++        if CGPreflightScreenCaptureAccess() { return .windowOnly }
++        return .minimalWave
++    }
++
++    static func permissionState() -> [String: Any] {
++        [
++            "accessibility": AXIsProcessTrusted(),
++            "screenCapture": CGPreflightScreenCaptureAccess(),
++            "mode": permissionMode().rawValue,
++        ]
++    }
++
++    private static func filterAndCap(_ rects: [SceneRect], display: CGRect, cap: Int) -> [SceneRect] {
++        let minArea = max(900.0, (display.width * display.height) * 0.00015)
++        var filtered = rects
++            .filter { $0.width >= 24 && $0.height >= 12 }
++            .filter { $0.width * $0.height >= minArea }
++            .filter { display.intersects($0.cgRect) }
++            .sorted { ($0.width * $0.height) > ($1.width * $1.height) }
++
++        if filtered.count < 40 {
++            filtered.append(contentsOf: minimalContours(display: display))
++        }
++
++        var seen = Set<String>()
++        var unique: [SceneRect] = []
++        for rect in filtered {
++            let key = "\(Int(rect.x)):\(Int(rect.y)):\(Int(rect.width)):\(Int(rect.height))"
++            guard !seen.contains(key) else { continue }
++            seen.insert(key)
++            unique.append(rect)
++            if unique.count >= cap { break }
++        }
++        return unique
++    }
++
++    private static func minimalContours(display: CGRect) -> [SceneRect] {
++        let inset = min(display.width, display.height) * 0.08
++        let inner = display.insetBy(dx: inset, dy: inset)
++        return [
++            SceneRect(inner),
++            SceneRect(x: inner.minX, y: inner.minY, width: inner.width, height: 2),
++            SceneRect(x: inner.minX, y: inner.maxY - 2, width: inner.width, height: 2),
++            SceneRect(x: inner.minX, y: inner.minY, width: 2, height: inner.height),
++            SceneRect(x: inner.maxX - 2, y: inner.minY, width: 2, height: inner.height),
++        ]
++    }
++
++    private static func contoursFromAX(display: CGRect, cap: Int) async -> [SceneRect] {
++        guard AXIsProcessTrusted() else { return [] }
++        let system = AXUIElementCreateSystemWide()
++        var windows: CFTypeRef?
++        let err = AXUIElementCopyAttributeValue(system, kAXWindowsAttribute as CFString, &windows)
++        guard err == .success, let list = windows as? [AXUIElement] else { return [] }
++
++        var rects: [SceneRect] = []
++        for window in list.prefix(cap * 2) {
++            guard let frame = axFrame(window), display.intersects(frame) else { continue }
++            rects.append(SceneRect(frame))
++            if rects.count >= cap { break }
++            let children = axChildren(window)
++            for child in children.prefix(12) {
++                guard let childFrame = axFrame(child), display.intersects(childFrame) else { continue }
++                rects.append(SceneRect(childFrame))
++                if rects.count >= cap { return rects }
++            }
++        }
++        return rects
++    }
++
++    private static func contoursFromScreenCapture(display: CGRect, cap: Int) async -> [SceneRect] {
++        do {
++            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
++            var rects: [SceneRect] = []
++            for window in content.windows {
++                let frame = window.frame
++                guard frame.width > 40, frame.height > 24, display.intersects(frame) else { continue }
++                if window.owningApplication?.bundleIdentifier?.contains("clyra") == true { continue }
++                if window.owningApplication?.bundleIdentifier?.contains("opencluely") == true { continue }
++                rects.append(SceneRect(frame))
++                if rects.count >= cap { break }
++            }
++            return rects
++        } catch {
++            return []
++        }
++    }
++
++    private static func axFrame(_ element: AXUIElement) -> CGRect? {
++        var position: CFTypeRef?
++        var size: CFTypeRef?
++        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &position) == .success,
++              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &size) == .success,
++              let posVal = position, let sizeVal = size else { return nil }
++        var point = CGPoint.zero
++        var cgSize = CGSize.zero
++        guard AXValueGetValue(posVal as! AXValue, .cgPoint, &point),
++              AXValueGetValue(sizeVal as! AXValue, .cgSize, &cgSize) else { return nil }
++        return CGRect(origin: point, size: cgSize)
++    }
++
++    private static func axChildren(_ element: AXUIElement) -> [AXUIElement] {
++        var children: CFTypeRef?
++        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
++              let list = children as? [AXUIElement] else { return [] }
++        return list
++    }
++}
+diff --git a/native/visual-scan/Sources/VisualScan/SceneModels.swift b/native/visual-scan/Sources/VisualScan/SceneModels.swift
+new file mode 100644
+index 0000000..5d37e8b
+--- /dev/null
++++ b/native/visual-scan/Sources/VisualScan/SceneModels.swift
+@@ -0,0 +1,79 @@
++import Foundation
++import CoreGraphics
++
++struct SceneRect: Codable {
++    var x: Double
++    var y: Double
++    var width: Double
++    var height: Double
++
++    var cgRect: CGRect {
++        CGRect(x: x, y: y, width: width, height: height)
++    }
++
++    init(_ rect: CGRect) {
++        x = rect.origin.x
++        y = rect.origin.y
++        width = rect.size.width
++        height = rect.size.height
++    }
++
++    init(x: Double, y: Double, width: Double, height: Double) {
++        self.x = x
++        self.y = y
++        self.width = width
++        self.height = height
++    }
++}
++
++struct SceneDisplay: Codable {
++    var x: Double
++    var y: Double
++    var width: Double
++    var height: Double
++
++    var cgRect: CGRect {
++        CGRect(x: x, y: y, width: width, height: height)
++    }
++
++    init(_ rect: CGRect) {
++        x = rect.origin.x
++        y = rect.origin.y
++        width = rect.size.width
++        height = rect.size.height
++    }
++}
++
++struct ScanScene: Codable {
++    var display: SceneDisplay
++    var contours: [SceneRect]
++    var quality: String?
++    var reduceMotion: Bool?
++    var permissionMode: String?
++}
++
++enum ScanQuality: String {
++    case low, medium, high
++
++    init(raw: String?) {
++        switch raw?.lowercased() {
++        case "low": self = .low
++        case "medium": self = .medium
++        default: self = .high
++        }
++    }
++
++    var contourCap: Int {
++        switch self {
++        case .low: return 40
++        case .medium: return 80
++        case .high: return 120
++        }
++    }
++}
++
++enum PermissionMode: String, Codable {
++    case fullAX
++    case windowOnly
++    case minimalWave
++}
+diff --git a/native/visual-scan/Sources/VisualScan/VisualScanCLI.swift b/native/visual-scan/Sources/VisualScan/VisualScanCLI.swift
+new file mode 100644
+index 0000000..d2a2f7e
+--- /dev/null
++++ b/native/visual-scan/Sources/VisualScan/VisualScanCLI.swift
+@@ -0,0 +1,106 @@
++import AppKit
++import Foundation
++
++enum VisualScanCLI {
++    static func run(arguments: [String]) async -> Int32 {
++        guard arguments.count >= 2 else {
++            fputs("usage: visual-scan <start|permission-state|is-available>\n", stderr)
++            return 2
++        }
++
++        let command = arguments[1]
++        switch command {
++        case "is-available":
++            print("true")
++            return 0
++        case "permission-state":
++            let data = try? JSONSerialization.data(withJSONObject: SceneGeometryCache.permissionState(), options: [.prettyPrinted])
++            if let data, let text = String(data: data, encoding: .utf8) {
++                print(text)
++            } else {
++                print("{}")
++            }
++            return 0
++        case "start":
++            return await start(arguments: Array(arguments.dropFirst(2)))
++        case "stop":
++            return 0
++        default:
++            fputs("unknown command: \(command)\n", stderr)
++            return 2
++        }
++    }
++
++    private static func start(arguments: [String]) async -> Int32 {
++        let app = NSApplication.shared
++        app.setActivationPolicy(.accessory)
++
++        var scene: ScanScene?
++        var quality = ScanQuality.high
++        var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
++
++        if let jsonIndex = arguments.firstIndex(of: "--scene-json"),
++           arguments.indices.contains(jsonIndex + 1) {
++            let jsonText = arguments[jsonIndex + 1]
++            if let data = jsonText.data(using: .utf8) {
++                scene = try? JSONDecoder().decode(ScanScene.self, from: data)
++            }
++        } else if let pathIndex = arguments.firstIndex(of: "--scene-file"),
++                  arguments.indices.contains(pathIndex + 1) {
++            let path = arguments[pathIndex + 1]
++            if let data = FileManager.default.contents(atPath: path) {
++                scene = try? JSONDecoder().decode(ScanScene.self, from: data)
++            }
++        } else if !stdinIsTTY() {
++            let input = readStdin()
++            if let data = input.data(using: .utf8), !input.isEmpty {
++                scene = try? JSONDecoder().decode(ScanScene.self, from: data)
++            }
++        }
++
++        if let qIndex = arguments.firstIndex(of: "--quality"), arguments.indices.contains(qIndex + 1) {
++            quality = ScanQuality(raw: arguments[qIndex + 1])
++        }
++        if arguments.contains("--reduce-motion") {
++            reduceMotion = true
++        }
++
++        if scene == nil {
++            scene = await SceneGeometryCache.buildScene(quality: quality, reduceMotion: reduceMotion)
++        }
++
++        guard let readyScene = scene else {
++            fputs("failed to build scan scene\n", stderr)
++            return 1
++        }
++
++        let semaphore = DispatchSemaphore(value: 0)
++        var exitCode: Int32 = 0
++
++        DispatchQueue.main.async {
++            let panel = OverlayPanel(scene: readyScene)
++            panel.runAnimation {
++                panel.close()
++                exitCode = 0
++                semaphore.signal()
++                app.terminate(nil)
++            }
++        }
++
++        app.run()
++        _ = semaphore.wait(timeout: .now() + 4.0)
++        return exitCode
++    }
++
++    private static func stdinIsTTY() -> Bool {
++        isatty(STDIN_FILENO) == 1
++    }
++
++    private static func readStdin() -> String {
++        var data = Data()
++        while let chunk = try? FileHandle.standardInput.read(upToCount: 4096), !chunk.isEmpty {
++            data.append(chunk)
++        }
++        return String(data: data, encoding: .utf8) ?? ""
++    }
++}
+diff --git a/native/visual-scan/Sources/VisualScan/main.swift b/native/visual-scan/Sources/VisualScan/main.swift
+new file mode 100644
+index 0000000..4331e7f
+--- /dev/null
++++ b/native/visual-scan/Sources/VisualScan/main.swift
+@@ -0,0 +1,14 @@
++import Foundation
++
++let args = CommandLine.arguments
++let code = DispatchQueue.main.sync {
++    let semaphore = DispatchSemaphore(value: 0)
++    var result: Int32 = 0
++    Task {
++        result = await VisualScanCLI.run(arguments: args)
++        semaphore.signal()
++    }
++    _ = semaphore.wait(timeout: .now() + 6.0)
++    return result
++}
++exit(code)
+diff --git a/scripts/clone-opencluely.sh b/scripts/clone-opencluely.sh
+index 2b293d9..8a5c436 100755
+--- a/scripts/clone-opencluely.sh
++++ b/scripts/clone-opencluely.sh
+@@ -25,6 +25,7 @@ if [[ -d "${BRIDGE}" ]]; then
+   fi
+   cp "${BRIDGE}/config.js" "${DEST}/src/core/config.js"
+   cp "${BRIDGE}/main.js" "${DEST}/main.js"
++  cp "${BRIDGE}/visual-scan-bridge.js" "${DEST}/visual-scan-bridge.js"
+   cp "${BRIDGE}/window.manager.js" "${DEST}/src/managers/window.manager.js"
+   cp "${BRIDGE}/prompt-loader.js" "${DEST}/prompt-loader.js"
+   if [[ -f "${BRIDGE}/preload.js" ]]; then
+diff --git a/scripts/opencluely-bridge/main.js b/scripts/opencluely-bridge/main.js
+index b1525d1..2daad29 100644
+--- a/scripts/opencluely-bridge/main.js
++++ b/scripts/opencluely-bridge/main.js
+@@ -108,6 +108,7 @@ const desktopControl = require("./src/services/desktop-control.service");
+ // Managers
+ const windowManager = require("./src/managers/window.manager");
+ const sessionManager = require("./src/managers/session.manager");
++const visualScanBridge = require("./visual-scan-bridge");
+ 
+ class ApplicationController {
+   constructor() {
+@@ -478,6 +479,11 @@ class ApplicationController {
+ 
+   setupIPCHandlers() {
+   ipcMain.handle("take-screenshot", () => this.triggerScreenshotOCR());
++  ipcMain.handle("visual-scan:start", async (_event, payload = {}) => visualScanBridge.start(payload));
++  ipcMain.handle("visual-scan:stop", async () => visualScanBridge.stop());
++  ipcMain.handle("visual-scan:is-available", async () => ({ ok: true, available: await visualScanBridge.isAvailable() }));
++  ipcMain.handle("visual-scan:permission-state", async () => visualScanBridge.permissionState());
++  ipcMain.handle("visual-scan:set-quality", async (_event, payload = {}) => visualScanBridge.setQuality(payload?.quality));
+   ipcMain.handle("list-displays", () => captureService.listDisplays());
+   ipcMain.handle("capture-area", (event, options) => captureService.captureAndProcess(options));
+     
+@@ -1588,6 +1594,9 @@ class ApplicationController {
+       return;
+     }
+ 
++    // Visual Intelligence Scan — fire-and-forget, does not block capture.
++    visualScanBridge.fireVisualScan();
++
+     const startTime = Date.now();
+ 
+     try {
+diff --git a/scripts/opencluely-bridge/preload.js b/scripts/opencluely-bridge/preload.js
+index 9bc81ad..19baf90 100644
+--- a/scripts/opencluely-bridge/preload.js
++++ b/scripts/opencluely-bridge/preload.js
+@@ -125,6 +125,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
+   // Display management
+   listDisplays: () => ipcRenderer.invoke('list-displays'),
+   captureArea: (options) => ipcRenderer.invoke('capture-area', options),
++
++  // Visual Intelligence Scan
++  visualScan: {
++    start: (payload) => ipcRenderer.invoke('visual-scan:start', payload || {}),
++    stop: () => ipcRenderer.invoke('visual-scan:stop'),
++    isAvailable: () => ipcRenderer.invoke('visual-scan:is-available'),
++    permissionState: () => ipcRenderer.invoke('visual-scan:permission-state'),
++    setQuality: (quality) => ipcRenderer.invoke('visual-scan:set-quality', { quality }),
++  },
+   
+   // Event listeners
+   onTranscriptionReceived: (callback) => ipcRenderer.on('transcription-received', callback),
+diff --git a/scripts/opencluely-bridge/visual-scan-bridge.js b/scripts/opencluely-bridge/visual-scan-bridge.js
+new file mode 100644
+index 0000000..8934b9b
+--- /dev/null
++++ b/scripts/opencluely-bridge/visual-scan-bridge.js
+@@ -0,0 +1,56 @@
++/**
++ * OpenCluely bridge helper — loads Clyra visual-scan manager from electron/.
++ * Fire-and-forget; never blocks capture for more than ~50ms.
++ */
++const path = require("path");
++const { pathToFileURL } = require("url");
++
++let managerPromise = null;
++
++function repoRootFromBridge() {
++  // apps/opencluely/main.js → repo root
++  return path.resolve(__dirname, "..", "..");
++}
++
++function loadManager() {
++  if (!managerPromise) {
++    const root = repoRootFromBridge();
++    const modulePath = path.join(root, "electron", "visual-scan-manager.mjs");
++    managerPromise = import(pathToFileURL(modulePath).href).then((mod) =>
++      mod.getVisualScanManager({ projectRoot: root }),
++    );
++  }
++  return managerPromise;
++}
++
++function fireVisualScan(options = {}) {
++  void loadManager()
++    .then((manager) => manager.start(options))
++    .catch(() => undefined);
++}
++
++async function start(options = {}) {
++  const manager = await loadManager();
++  return manager.start(options);
++}
++
++module.exports = {
++  fireVisualScan,
++  start,
++  async isAvailable() {
++    const manager = await loadManager();
++    return manager.isAvailable();
++  },
++  async permissionState() {
++    const manager = await loadManager();
++    return manager.permissionState();
++  },
++  async stop() {
++    const manager = await loadManager();
++    return manager.stop();
++  },
++  async setQuality(quality) {
++    const manager = await loadManager();
++    return manager.setQuality(quality);
++  },
++};
+diff --git a/src/lib/electron-runtime.ts b/src/lib/electron-runtime.ts
+index 901a499..72a83da 100644
+--- a/src/lib/electron-runtime.ts
++++ b/src/lib/electron-runtime.ts
+@@ -80,6 +80,13 @@ export type ClyraDesktopBridge = {
+     toggle?: () => Promise<{ ok: boolean; error?: string }>;
+     status?: () => Promise<{ ok: boolean; managed?: boolean; port?: number; ready?: boolean }>;
+   };
++  visualScan?: {
++    start?: (payload?: { displayId?: number; quality?: string }) => Promise<{ ok: boolean; backend?: string; startedMs?: number; error?: string }>;
++    stop?: () => Promise<{ ok: boolean }>;
++    isAvailable?: () => Promise<{ ok: boolean; available?: boolean }>;
++    permissionState?: () => Promise<{ ok: boolean; mode?: string; platform?: string }>;
++    setQuality?: (quality: string) => Promise<{ ok: boolean; quality?: string }>;
++  };
+   seeScreen?: (question?: string) => Promise<{
+     ok: boolean;
+     vision?: { summary?: string; text?: string; ocrText?: string; model?: string; source?: string };
+diff --git a/tools/visual-scan-smoke.mjs b/tools/visual-scan-smoke.mjs
+new file mode 100644
+index 0000000..f17def4
+--- /dev/null
++++ b/tools/visual-scan-smoke.mjs
+@@ -0,0 +1,34 @@
++/**
++ * Smoke test for Visual Intelligence Scan Electron fallback (Linux-friendly).
++ */
++import { app, screen } from "electron";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { getVisualScanManager } from "../electron/visual-scan-manager.mjs";
++
++const here = path.dirname(fileURLToPath(import.meta.url));
++const projectRoot = path.resolve(here, "..");
++
++async function main() {
++  await app.whenReady();
++  const manager = getVisualScanManager({ projectRoot });
++  const available = manager.isAvailable();
++  const permissions = manager.permissionState();
++  const display = screen.getPrimaryDisplay();
++  console.log("[visual-scan-smoke] available:", available);
++  console.log("[visual-scan-smoke] permissions:", JSON.stringify(permissions));
++  console.log("[visual-scan-smoke] display:", display.bounds);
++
++  const started = await manager.start({ displayId: display.id, quality: "high" });
++  console.log("[visual-scan-smoke] start:", JSON.stringify(started));
++
++  await new Promise((resolve) => setTimeout(resolve, 1900));
++  const stopped = await manager.stop();
++  console.log("[visual-scan-smoke] stop:", JSON.stringify(stopped));
++  app.exit(started.ok ? 0 : 1);
++}
++
++main().catch((error) => {
++  console.error("[visual-scan-smoke] failed:", error);
++  app.exit(1);
++});
+-- 
+2.43.0
+
+
+From 471cf2bf3dcfc938362779a903936c2828948980 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 9 Aug 2026 05:20:32 +0000
+Subject: [PATCH 2/2] Polish OpenCluely bar: expand-down Ask, chat-parity UI,
+ smarter search
+
+Pin the overlay top edge so expansion only grows downward, make Ask fade
+open immediately without staged delay, match chat-tool print replies and
+user bubbles, sync light/dark theme, add thinking border glow and button
+hover motion, and stop casual/screen questions from triggering web search.
+---
+ scripts/opencluely-bridge/html/index.html | 438 +++++++++++++++-------
+ scripts/opencluely-bridge/llm.service.js  |  17 +-
+ scripts/opencluely-bridge/main.js         |  19 +-
+ scripts/opencluely-bridge/ui/bar-chat.js  | 112 ++++--
+ src/App.tsx                               |  11 +-
+ 5 files changed, 429 insertions(+), 168 deletions(-)
+
+diff --git a/scripts/opencluely-bridge/html/index.html b/scripts/opencluely-bridge/html/index.html
+index e54ae5c..a8387b8 100644
+--- a/scripts/opencluely-bridge/html/index.html
++++ b/scripts/opencluely-bridge/html/index.html
+@@ -7,35 +7,64 @@
+     <link href="./src/styles/common.css" rel="stylesheet" />
+     <style>
+       :root {
+-        --oc-glass: rgba(248, 249, 251, 0.82);
+-        --oc-glass-open: rgba(255, 255, 255, 0.90);
+-        --oc-border: rgba(15, 23, 42, 0.07);
++        --oc-glass: rgba(248, 249, 251, 0.88);
++        --oc-glass-open: rgba(255, 255, 255, 0.94);
++        --oc-border: rgba(15, 23, 42, 0.08);
+         --oc-text: #3d4656;
+-        --oc-text-strong: #1f2937;
+-        --oc-shadow: 0 12px 32px rgba(15, 23, 42, 0.10), 0 2px 8px rgba(15, 23, 42, 0.05);
+-        --oc-btn-bg: rgba(255, 255, 255, 0.72);
+-        --oc-btn-border: rgba(15, 23, 42, 0.05);
++        --oc-text-strong: #1e293b;
++        --oc-shadow: 0 10px 28px rgba(15, 23, 42, 0.09), 0 2px 6px rgba(15, 23, 42, 0.04);
++        --oc-btn-bg: rgba(255, 255, 255, 0.78);
++        --oc-btn-border: rgba(15, 23, 42, 0.06);
+         --oc-close-bg: #ffffff;
+         --oc-close-fg: #5b6575;
+         --oc-drag: #8b95a5;
+-        --oc-input-bg: rgba(255, 255, 255, 0.92);
+-        --oc-msg-bg: rgba(255, 255, 255, 0.86);
++        --oc-input-bg: #ffffff;
++        --oc-input-border: #dfe4e9;
++        --oc-msg-bg: transparent;
++        --oc-user-bubble: #aec7f1;
++        --oc-user-bubble-border: rgba(148, 163, 184, 0.28);
++        --oc-assistant-fg: #1e293b;
++        --oc-hint: #8b96a5;
+         --oc-ease: cubic-bezier(0.16, 1, 0.3, 1);
+         --oc-ease-soft: cubic-bezier(0.33, 1, 0.68, 1);
+-        --oc-dur-w: 520ms;
+-        --oc-dur-h: 480ms;
+-        --oc-dur-fast: 220ms;
+-        --oc-expanded-w: 600px;
+-        --oc-bar-h: 56px;
+-        --oc-drawer-h: 360px;
++        --oc-dur-w: 340ms;
++        --oc-dur-h: 360ms;
++        --oc-dur-fast: 180ms;
++        --oc-expanded-w: 560px;
++        --oc-bar-h: 52px;
++        --oc-drawer-h: 340px;
+         --oc-control-bg: linear-gradient(180deg, #1e2a44 0%, #152038 55%, #101a2e 100%);
+         --oc-stealth-on: linear-gradient(180deg, #1e2a44 0%, #152038 55%, #101a2e 100%);
+         --oc-stealth-accent: #7dd3fc;
++        --oc-glow: #3b82f6;
+       }
+ 
+-      html.oc-stealth {
+-        --oc-glass: rgba(22, 27, 34, 0.86);
++      /* System dark theme (separate from Stealth) */
++      html.oc-dark {
++        --oc-glass: rgba(22, 27, 34, 0.88);
+         --oc-glass-open: rgba(17, 24, 39, 0.94);
++        --oc-border: rgba(148, 163, 184, 0.16);
++        --oc-text: #cbd5e1;
++        --oc-text-strong: #f1f5f9;
++        --oc-shadow: 0 12px 32px rgba(0, 0, 0, 0.42), 0 2px 8px rgba(0, 0, 0, 0.24);
++        --oc-btn-bg: rgba(30, 41, 59, 0.9);
++        --oc-btn-border: rgba(148, 163, 184, 0.16);
++        --oc-close-bg: rgba(30, 41, 59, 0.96);
++        --oc-close-fg: #e2e8f0;
++        --oc-drag: #94a3b8;
++        --oc-input-bg: #0f172a;
++        --oc-input-border: rgba(148, 163, 184, 0.22);
++        --oc-msg-bg: transparent;
++        --oc-user-bubble: #334155;
++        --oc-user-bubble-border: rgba(148, 163, 184, 0.28);
++        --oc-assistant-fg: #e2e8f0;
++        --oc-hint: #94a3b8;
++        --oc-glow: #60a5fa;
++      }
++
++      html.oc-stealth {
++        --oc-glass: rgba(22, 27, 34, 0.9);
++        --oc-glass-open: rgba(17, 24, 39, 0.96);
+         --oc-border: rgba(148, 163, 184, 0.14);
+         --oc-text: #cbd5e1;
+         --oc-text-strong: #f1f5f9;
+@@ -45,8 +74,14 @@
+         --oc-close-bg: rgba(30, 41, 59, 0.96);
+         --oc-close-fg: #e2e8f0;
+         --oc-drag: #94a3b8;
+-        --oc-input-bg: rgba(15, 23, 42, 0.9);
+-        --oc-msg-bg: rgba(30, 41, 59, 0.9);
++        --oc-input-bg: rgba(15, 23, 42, 0.95);
++        --oc-input-border: rgba(125, 211, 252, 0.22);
++        --oc-msg-bg: transparent;
++        --oc-user-bubble: rgba(125, 211, 252, 0.16);
++        --oc-user-bubble-border: rgba(125, 211, 252, 0.28);
++        --oc-assistant-fg: #e2e8f0;
++        --oc-hint: #94a3b8;
++        --oc-glow: #7dd3fc;
+       }
+ 
+       * { box-sizing: border-box; }
+@@ -62,8 +97,9 @@
+         -webkit-font-smoothing: antialiased;
+         -webkit-app-region: no-drag;
+         color-scheme: light;
+-        transition: color-scheme 420ms ease;
++        transition: color-scheme 280ms ease;
+       }
++      html.oc-dark, html.oc-dark body,
+       html.oc-stealth, html.oc-stealth body { color-scheme: dark; }
+ 
+       .oc-shell {
+@@ -71,21 +107,71 @@
+         flex-direction: column;
+         align-items: stretch;
+         width: max-content;
+-        min-width: 420px;
++        min-width: 400px;
+         background: transparent;
+         border-radius: 999px;
+         overflow: hidden;
+         opacity: 1;
+-        transform-origin: center top;
++        position: relative;
++        /* Grow downward from the top edge — never shift vertically. */
++        transform-origin: top center;
+         transition:
+           width var(--oc-dur-w) var(--oc-ease),
+           min-width var(--oc-dur-w) var(--oc-ease),
+-          border-radius var(--oc-dur-h) var(--oc-ease-soft),
+-          background 420ms var(--oc-ease-soft),
+-          box-shadow 420ms var(--oc-ease-soft),
+-          border-color 420ms var(--oc-ease-soft),
+-          opacity 380ms var(--oc-ease-soft),
+-          transform 520ms var(--oc-ease);
++          border-radius var(--oc-dur-h) var(--oc-ease),
++          background 280ms var(--oc-ease-soft),
++          box-shadow 280ms var(--oc-ease-soft),
++          border-color 280ms var(--oc-ease-soft),
++          opacity 220ms var(--oc-ease);
++        will-change: width, opacity;
++      }
++      .oc-shell.is-ask-fade {
++        animation: oc-ask-fade-down 340ms var(--oc-ease) both;
++      }
++      @keyframes oc-ask-fade-down {
++        from { opacity: 0.72; }
++        to { opacity: 1; }
++      }
++      /* Subtle blue glow line traveling the full border while AI thinks */
++      .oc-shell.is-thinking::before {
++        content: "";
++        position: absolute;
++        inset: 0;
++        border-radius: inherit;
++        padding: 1.5px;
++        background: conic-gradient(from var(--oc-glow-angle, 0deg), transparent 0%, transparent 62%, rgba(59,130,246,0.05) 72%, var(--oc-glow) 86%, rgba(225,238,255,0.85) 92%, transparent 100%);
++        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
++        -webkit-mask-composite: xor;
++        mask-composite: exclude;
++        pointer-events: none;
++        z-index: 8;
++        animation: oc-glow-spin 1.8s linear infinite;
++        opacity: 0.9;
++      }
++      @property --oc-glow-angle {
++        syntax: "<angle>";
++        inherits: false;
++        initial-value: 0deg;
++      }
++      @keyframes oc-glow-spin {
++        to { --oc-glow-angle: 360deg; }
++      }
++      @supports not (background: conic-gradient(from var(--oc-glow-angle), #000, #fff)) {
++        .oc-shell.is-thinking::before {
++          background: linear-gradient(90deg, transparent, rgba(59,130,246,0.35), rgba(225,238,255,0.7), rgba(59,130,246,0.35), transparent);
++          background-size: 200% 100%;
++          animation: oc-glow-slide 1.6s linear infinite;
++          -webkit-mask: none;
++          mask: none;
++          border-radius: inherit;
++          padding: 0;
++          border: 1.5px solid transparent;
++          opacity: 0.55;
++        }
++        @keyframes oc-glow-slide {
++          0% { background-position: 100% 0; }
++          100% { background-position: -100% 0; }
++        }
+       }
+ 
+       .oc-shell.is-boot-squish {
+@@ -106,9 +192,9 @@
+       }
+       .oc-shell.is-boot-expand {
+         opacity: 1;
+-        transform: scaleX(1) scaleY(1);
++        transform: none;
+         width: max-content;
+-        min-width: 420px;
++        min-width: 400px;
+       }
+       .oc-shell.is-boot-reveal .oc-boot-hide {
+         opacity: 1;
+@@ -138,10 +224,10 @@
+         height: var(--oc-bar-h);
+         display: flex;
+         align-items: center;
+-        gap: 10px;
+-        padding: 0 10px 0 8px;
++        gap: 8px;
++        padding: 0 8px 0 8px;
+         width: max-content;
+-        min-width: 420px;
++        min-width: 400px;
+         background: var(--oc-glass);
+         border: 1px solid rgba(255, 255, 255, 0.78);
+         border-radius: 999px;
+@@ -239,6 +325,26 @@
+         flex-shrink: 1;
+         min-width: 0;
+       }
++      .oc-shell.is-wide .command-tab,
++      .oc-shell.is-chat-open .command-tab {
++        /* Keep left/right chrome optically balanced when expanded */
++        padding-inline: 10px;
++      }
++      .oc-shell.is-chat-open .oc-drag,
++      .oc-shell.is-wide .oc-drag {
++        margin-left: 0;
++      }
++      .oc-trailing {
++        display: inline-flex;
++        align-items: center;
++        gap: 6px;
++        flex-shrink: 0;
++        margin-left: 2px;
++        -webkit-app-region: no-drag;
++      }
++      .oc-shell.is-chat-open .oc-trailing {
++        margin-right: 0;
++      }
+       .oc-pill-btn {
+         height: 36px;
+         padding: 0 12px;
+@@ -258,18 +364,26 @@
+         white-space: nowrap;
+       }
+       .oc-pill-btn .oc-btn-icon {
+-        width: 16px;
+-        height: 16px;
++        width: 15px;
++        height: 15px;
+         flex-shrink: 0;
+         display: block;
++        transition: transform 280ms var(--oc-ease), opacity 200ms ease;
++        transform-origin: center;
+       }
+       .oc-pill-btn .oc-btn-label { line-height: 1; }
+       .oc-pill-btn:hover {
+-        filter: brightness(1.03);
++        background: color-mix(in srgb, var(--oc-btn-bg) 86%, #dbeafe 14%);
+         color: var(--oc-text-strong);
+-        transform: translateY(-0.5px);
++        border-color: color-mix(in srgb, var(--oc-btn-border) 70%, #93c5fd 30%);
++        transform: translateY(-1px);
++        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
++      }
++      .oc-pill-btn:hover .oc-btn-icon {
++        transform: scale(1.08) rotate(-4deg);
+       }
+       .oc-pill-btn:active { transform: translateY(0); }
++      .oc-pill-btn:active .oc-btn-icon { transform: scale(0.96); }
+       .oc-pill-btn.is-active {
+         background: rgba(243, 244, 246, 0.95);
+         color: var(--oc-text-strong);
+@@ -437,6 +551,12 @@
+         .chat-drawer {
+           transition-duration: 0.01ms !important;
+         }
++        .oc-shell.is-thinking::before,
++        .oc-pill-btn .oc-btn-icon,
++        .chat-messages .message.user .message-text,
++        .chat-messages .message.assistant .message-text {
++          animation: none !important;
++        }
+       }
+       .chat-drawer-inner {
+         height: calc(var(--oc-drawer-h) - 8px);
+@@ -455,79 +575,115 @@
+         font-weight: 600;
+       }
+       .chat-drawer-header .hint {
+-        color: #8b95a5;
++        color: var(--oc-hint);
+         font-weight: 500;
+         font-size: 11px;
+       }
+       .chat-messages {
+         flex: 1;
+         overflow-y: auto;
+-        padding: 6px 14px 10px;
++        padding: 4px 14px 8px;
+         display: flex;
+         flex-direction: column;
+-        gap: 8px;
++        gap: 10px;
+       }
++      /* Chat-tool parity: assistant is print text (no bubble); user keeps bubble + rise animation */
+       .chat-messages .message {
+-        max-width: 92%;
+-        margin-bottom: 0;
+-        padding: 9px 11px;
+-        border-radius: 12px;
+-        border-left: none;
+-        font-size: 12.5px;
+-        line-height: 1.45;
+-        color: var(--oc-text-strong) !important;
+-        background: var(--oc-msg-bg) !important;
+-        border: 1px solid var(--oc-border);
+-        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+-        backdrop-filter: none;
+-        text-shadow: none;
++        max-width: 94%;
++        margin: 0;
++        padding: 0;
++        border: none;
++        border-radius: 0;
++        background: transparent !important;
++        box-shadow: none !important;
++        font-size: 13px;
++        line-height: 1.5;
++        color: var(--oc-assistant-fg) !important;
+       }
+       .chat-messages .message.user {
+         align-self: flex-end;
+-        background: #e8eef8 !important;
+-        border-color: rgba(55, 65, 81, 0.12);
++        max-width: 78%;
++      }
++      .chat-messages .message.user .message-text {
++        display: block;
++        padding: 9px 12px;
++        border-radius: 16px;
++        border: 1px solid var(--oc-user-bubble-border);
++        background: var(--oc-user-bubble) !important;
++        color: #1e293b !important;
++        white-space: pre-wrap;
++        box-shadow: none;
++        transform-origin: bottom right;
++        animation: oc-user-bubble-appear 0.42s var(--oc-ease) both;
++      }
++      html.oc-dark .chat-messages .message.user .message-text,
++      html.oc-stealth .chat-messages .message.user .message-text {
++        color: #f1f5f9 !important;
+       }
+-      html.oc-stealth .chat-messages .message.user {
+-        background: rgba(125, 211, 252, 0.14) !important;
+-        border-color: rgba(125, 211, 252, 0.22);
++      .chat-messages .message.user.is-first .message-text {
++        animation-name: oc-user-bubble-rise;
++        animation-duration: 0.72s;
++      }
++      @keyframes oc-user-bubble-appear {
++        from { opacity: 0; transform: translateY(8px) scale(0.96); }
++        to { opacity: 1; transform: translateY(0) scale(1); }
++      }
++      @keyframes oc-user-bubble-rise {
++        0% { opacity: 0; transform: translateY(36px) scale(0.94); filter: blur(6px); }
++        55% { opacity: 1; transform: translateY(-2px) scale(1.01); filter: blur(0); }
++        100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+       }
+       .chat-messages .message.assistant,
+       .chat-messages .message.system,
+       .chat-messages .message.transcription {
+-        align-self: flex-start;
+-        background: rgba(255, 255, 255, 0.9) !important;
++        align-self: stretch;
++        max-width: 100%;
++        padding: 2px 2px 0;
++      }
++      .chat-messages .message.assistant .message-text,
++      .chat-messages .message.system .message-text {
++        color: var(--oc-assistant-fg) !important;
++        font-size: 13px;
++        line-height: 1.55;
++        white-space: normal;
++        animation: oc-assistant-print 0.38s var(--oc-ease) both;
++      }
++      @keyframes oc-assistant-print {
++        from { opacity: 0; transform: translateY(4px); }
++        to { opacity: 1; transform: none; }
+       }
+       .chat-messages .message.error {
+-        align-self: flex-start;
+-        background: #fef2f2 !important;
+-        border-color: rgba(239, 68, 68, 0.2);
+-        color: #991b1b !important;
++        align-self: stretch;
++        color: #b91c1c !important;
+       }
+       .chat-messages .message-time {
+-        font-size: 10px;
+-        color: #8b95a5 !important;
+-        margin-bottom: 3px;
+-        font-weight: 500;
+-      }
+-      .chat-messages .message-text {
+-        color: var(--oc-text-strong) !important;
+-        text-shadow: none !important;
+-        font-size: 12.5px;
+-        line-height: 1.45;
+-        white-space: normal;
++        display: none; /* match chat tool — no timestamp chrome */
+       }
+       .chat-messages .message-text code {
+         background: rgba(15, 23, 42, 0.06) !important;
+-        color: #334155 !important;
++        color: inherit !important;
+         padding: 1px 4px;
+         border-radius: 4px;
+-        font-size: 11px;
++        font-size: 11.5px;
++      }
++      html.oc-dark .chat-messages .message-text code,
++      html.oc-stealth .chat-messages .message-text code {
++        background: rgba(148, 163, 184, 0.16) !important;
++      }
++      .thinking-row {
++        display: inline-flex;
++        align-items: center;
++        gap: 8px;
++        padding: 4px 2px;
++        color: var(--oc-hint);
++        font-size: 12px;
++        font-weight: 550;
+       }
+       .thinking-dots .dot {
+         display: inline-block;
+         animation: oc-pulse 1.1s ease-in-out infinite;
+         margin-right: 2px;
+-        color: #8b95a5;
++        color: var(--oc-glow);
+       }
+       .thinking-dots .dot:nth-child(2) { animation-delay: 0.15s; }
+       .thinking-dots .dot:nth-child(3) { animation-delay: 0.3s; }
+@@ -536,51 +692,72 @@
+         50% { opacity: 1; transform: translateY(-1px); }
+       }
+ 
++      /* Scaled-down Clyra chat composer (no command palette) */
+       .chat-input-row {
+         display: flex;
+-        gap: 8px;
+-        padding: 10px 12px 12px;
+-        border-top: 1px solid rgba(15, 23, 42, 0.06);
++        gap: 0;
++        padding: 8px 12px 12px;
++        border-top: 1px solid var(--oc-border);
++        align-items: stretch;
++      }
++      .oc-composer {
++        flex: 1;
++        display: flex;
+         align-items: flex-end;
++        gap: 8px;
++        min-height: 44px;
++        padding: 6px 7px 6px 12px;
++        border-radius: 999px;
++        border: 1px solid var(--oc-input-border);
++        background: var(--oc-input-bg);
++        box-shadow: 0 6px 18px rgba(24, 33, 47, 0.06);
++        transition: border-color 180ms ease, box-shadow 180ms ease, border-radius 220ms var(--oc-ease);
++      }
++      .oc-composer:focus-within {
++        border-radius: 20px;
++        border-color: color-mix(in srgb, var(--oc-input-border) 55%, #94a3b8 45%);
++        box-shadow: 0 0 0 3px rgba(73, 106, 149, 0.10), 0 6px 18px rgba(24, 33, 47, 0.06);
++      }
++      html.oc-dark .oc-composer:focus-within,
++      html.oc-stealth .oc-composer:focus-within {
++        box-shadow: 0 0 0 3px rgba(125, 211, 252, 0.12), 0 6px 18px rgba(0, 0, 0, 0.25);
+       }
+       #barChatInput {
+         flex: 1;
+         resize: none;
+-        min-height: 38px;
+-        max-height: 96px;
+-        background: var(--oc-input-bg);
+-        border: 1px solid var(--oc-border);
+-        border-radius: 12px;
++        min-height: 28px;
++        max-height: 88px;
++        background: transparent;
++        border: none;
++        border-radius: 0;
+         color: var(--oc-text-strong);
+-        padding: 9px 11px;
++        padding: 6px 0;
+         font-size: 13px;
++        line-height: 1.45;
+         font-family: inherit;
+         outline: none;
+-        box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.03);
+-      }
+-      #barChatInput::placeholder { color: var(--oc-drag); }
+-      #barChatInput:focus {
+-        border-color: rgba(55, 65, 81, 0.28);
+-        box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.06);
+-      }
+-      html.oc-stealth #barChatInput:focus {
+-        border-color: rgba(125, 211, 252, 0.4);
+-        box-shadow: 0 0 0 3px rgba(125, 211, 252, 0.12);
++        box-shadow: none;
+       }
++      #barChatInput::placeholder { color: var(--oc-hint); }
+       #barChatSend {
+-        width: 38px;
+-        height: 38px;
+-        border-radius: 12px;
+-        border: 1px solid var(--oc-border);
+-        background: var(--oc-btn-bg);
+-        color: var(--oc-text-strong);
++        width: 32px;
++        height: 32px;
++        border-radius: 999px;
++        border: none;
++        background: #1e293b;
++        color: #fff;
+         cursor: pointer;
+         display: grid;
+         place-items: center;
+-        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+-      }
+-      #barChatSend:hover { filter: brightness(1.06); transform: scale(1.04); }
+-      #barChatSend svg { width: 15px; height: 15px; }
++        flex-shrink: 0;
++        transition: transform 180ms var(--oc-ease), background 180ms ease, opacity 180ms ease;
++      }
++      html.oc-dark #barChatSend,
++      html.oc-stealth #barChatSend { background: #e2e8f0; color: #0f172a; }
++      #barChatSend:hover { transform: scale(1.06); }
++      #barChatSend:active { transform: scale(0.96); }
++      #barChatSend svg { width: 14px; height: 14px; transition: transform 220ms var(--oc-ease); }
++      #barChatSend:hover svg { transform: translateY(-1px); }
+ 
+       .oc-shell.is-task-prompt {
+         /* Legacy class kept for chevron; compose uses is-control-compose */
+@@ -687,9 +864,9 @@
+             <svg class="oc-btn-icon" viewBox="0 0 16 16" aria-hidden="true">
+               <defs>
+                 <linearGradient id="ocSparkle" x1="0" y1="0" x2="1" y2="1">
+-                  <stop offset="0%" stop-color="#7c3aed"/>
++                  <stop offset="0%" stop-color="#3b82f6"/>
+                   <stop offset="55%" stop-color="#3b82f6"/>
+-                  <stop offset="100%" stop-color="#22d3ee"/>
++                  <stop offset="100%" stop-color="#93c5fd"/>
+                 </linearGradient>
+               </defs>
+               <path fill="url(#ocSparkle)" d="M8 1.2l1.15 3.55L12.8 6 9.15 7.25 8 10.8 6.85 7.25 3.2 6l3.65-1.25L8 1.2z"/>
+@@ -702,7 +879,7 @@
+             <svg class="oc-btn-icon" viewBox="0 0 16 16" aria-hidden="true">
+               <defs>
+                 <linearGradient id="ocBrain" x1="0" y1="0" x2="1" y2="1">
+-                  <stop offset="0%" stop-color="#7c3aed"/>
++                  <stop offset="0%" stop-color="#3b82f6"/>
+                   <stop offset="100%" stop-color="#2563eb"/>
+                 </linearGradient>
+               </defs>
+@@ -717,9 +894,9 @@
+             <svg class="oc-btn-icon oc-icon-control" viewBox="0 0 16 16" aria-hidden="true">
+               <defs>
+                 <linearGradient id="ocTarget" x1="0" y1="0" x2="1" y2="1">
+-                  <stop offset="0%" stop-color="#7c3aed"/>
++                  <stop offset="0%" stop-color="#3b82f6"/>
+                   <stop offset="55%" stop-color="#3b82f6"/>
+-                  <stop offset="100%" stop-color="#22d3ee"/>
++                  <stop offset="100%" stop-color="#93c5fd"/>
+                 </linearGradient>
+               </defs>
+               <circle cx="8" cy="8" r="5.4" fill="none" stroke="url(#ocTarget)" stroke-width="1.4"/>
+@@ -735,18 +912,19 @@
+           </button>
+         </div>
+ 
+-        <div class="oc-stealth-wrap oc-boot-hide" id="ocStealthWrap" title="Hide OpenCluely from screen shares & Zoom">
+-          <span class="oc-stealth-label">Stealth</span>
+-          <button type="button" class="oc-stealth-switch" id="ocStealthSwitch" role="switch" aria-checked="false" aria-label="Stealth mode"></button>
++        <div class="oc-trailing">
++          <div class="oc-stealth-wrap oc-boot-hide" id="ocStealthWrap" title="Hide OpenCluely from screen shares & Zoom">
++            <span class="oc-stealth-label">Stealth</span>
++            <button type="button" class="oc-stealth-switch" id="ocStealthSwitch" role="switch" aria-checked="false" aria-label="Stealth mode"></button>
++          </div>
++          <button type="button" class="oc-drag oc-boot-hide" id="ocDragHandle" title="Drag to move" aria-label="Drag bar">
++            <span class="oc-drag-dots" aria-hidden="true">
++              <span></span><span></span>
++              <span></span><span></span>
++              <span></span><span></span>
++            </span>
++          </button>
+         </div>
+-
+-        <button type="button" class="oc-drag oc-boot-hide" id="ocDragHandle" title="Drag to move" aria-label="Drag bar">
+-          <span class="oc-drag-dots" aria-hidden="true">
+-            <span></span><span></span>
+-            <span></span><span></span>
+-            <span></span><span></span>
+-          </span>
+-        </button>
+       </div>
+ 
+       <div class="chat-drawer" id="chatDrawer" aria-hidden="true">
+@@ -757,12 +935,14 @@
+           </div>
+           <div class="chat-messages" id="barChatMessages"></div>
+           <div class="chat-input-row">
+-            <textarea id="barChatInput" rows="1" placeholder="Type a message… (Shift+Enter for newline)"></textarea>
+-            <button type="button" id="barChatSend" title="Send" aria-label="Send">
+-              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+-                <path d="M4 12h12M13 6l7 6-7 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+-              </svg>
+-            </button>
++            <div class="oc-composer" data-composer="1">
++              <textarea id="barChatInput" rows="1" placeholder="Ask Clyra anything…"></textarea>
++              <button type="button" id="barChatSend" title="Send" aria-label="Send">
++                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
++                  <path d="M12 19V5M12 5l-6 6M12 5l6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
++                </svg>
++              </button>
++            </div>
+           </div>
+         </div>
+       </div>
+diff --git a/scripts/opencluely-bridge/llm.service.js b/scripts/opencluely-bridge/llm.service.js
+index cd8bab9..ce49639 100644
+--- a/scripts/opencluely-bridge/llm.service.js
++++ b/scripts/opencluely-bridge/llm.service.js
+@@ -255,20 +255,29 @@ class LLMService {
+   }
+ 
+   /**
+-   * Same heuristic as Clyra chat tool — when true, run /api/research/web-search first.
++   * Research-intent heuristic. Intentionally narrower than casual "what's…" questions
++   * so screen asks / local Q&A do not spuriously trigger web search.
+    */
++  looksLikeScreenQuestion(text) {
++    const t = String(text || '');
++    return /\b(what('?s| is) on (my )?screen|see (my )?screen|look at (my )?screen|on my screen|what (page|site|app|website|article) (am i|is) (on|open|this)|what (am i|is) (looking at|viewing)|read (the )?(page|screen|heading|title)|visible on (the )?screen|describe (the |my )?(screen|page|window|desktop|background)|screenshot|what do you see|can you see)\b/i.test(
++      t,
++    );
++  }
++
+   looksLikeWebSearchQuery(text) {
+     const raw = String(text || '').trim();
+     if (!raw) return false;
+-    const t = raw.replace(/^\/search\s+/i, '').trim() || raw;
++    if (this.looksLikeScreenQuestion(raw)) return false;
+     if (/^\/search\b/i.test(raw)) return true;
++    const t = raw.replace(/^\/search\s+/i, '').trim() || raw;
++    // Explicit research verbs / web phrasing only — not every "what's …" question.
+     return (
+       /^(?:search|look\s*up|find|research|google)\b/i.test(t) ||
+       /\b(?:search the web|look online|from the (?:web|internet)|web search)\b/i.test(t) ||
+       /\b(?:latest|current|today'?s|this week'?s|breaking)\b.+\b(?:news|price|score|release|update|headline)s?\b/i.test(
+         t,
+-      ) ||
+-      /^(?:what(?:'| i)?s|who is|when (?:did|is|was)|how many)\b.+/i.test(t)
++      )
+     );
+   }
+ 
+diff --git a/scripts/opencluely-bridge/main.js b/scripts/opencluely-bridge/main.js
+index 2daad29..10b093f 100644
+--- a/scripts/opencluely-bridge/main.js
++++ b/scripts/opencluely-bridge/main.js
+@@ -610,18 +610,33 @@ class ApplicationController {
+         const maxW = windowManager.getMainMaxWidth?.() || windowManager.windowConfigs?.main?.width || 520;
+         const clampedWidth = Math.max(minW, Math.min(maxW, Math.round(width || minW)));
+         const clampedHeight = Math.max(28, Math.min(900, Math.round(height || 28)));
++        // Pin the top edge so height growth is always downward — never float/jump vertically.
++        let pinnedX = null;
++        let pinnedY = null;
++        try {
++          const pos = mainWindow.getPosition();
++          pinnedX = pos[0];
++          pinnedY = pos[1];
++        } catch (_) {
++          /* ignore */
++        }
+         try {
+           mainWindow.setContentSize(Math.max(1, clampedWidth), Math.max(1, clampedHeight));
+         } catch (e) {
+           mainWindow.setSize(Math.max(1, clampedWidth), Math.max(1, clampedHeight));
+         }
+-        // recenter: true → pin to top-center; 'x' → keep Y, center horizontally;
+-        // false/undefined during height anim → do not move (avoids jank).
+         try {
+           if (recenter === true) {
+             windowManager.centerMainWindowAtTop?.();
+           } else if (recenter === "x") {
+             windowManager.centerMainWindowHorizontally?.();
++            // Re-pin Y after horizontal recenter (defensive against platforms that shift origin).
++            if (Number.isFinite(pinnedY)) {
++              const [nx] = mainWindow.getPosition();
++              mainWindow.setPosition(Math.round(nx), Math.round(pinnedY));
++            }
++          } else if (Number.isFinite(pinnedX) && Number.isFinite(pinnedY)) {
++            mainWindow.setPosition(Math.round(pinnedX), Math.round(pinnedY));
+           }
+         } catch (_) {
+           /* ignore */
+diff --git a/scripts/opencluely-bridge/ui/bar-chat.js b/scripts/opencluely-bridge/ui/bar-chat.js
+index c561c16..ecbc27a 100644
+--- a/scripts/opencluely-bridge/ui/bar-chat.js
++++ b/scripts/opencluely-bridge/ui/bar-chat.js
+@@ -8,12 +8,13 @@
+ (function () {
+   const HISTORY_KEY = 'opencluely_bar_chat_v2';
+   const GREETING = 'Hi, how can I help you?';
+-  const EXPANDED_W = 600;
+-  const COLLAPSED_H = 56;
+-  const DRAWER_H = 360;
++  const EXPANDED_W = 560;
++  const COLLAPSED_H = 52;
++  const DRAWER_H = 340;
+   // Keep in sync with --oc-dur-w / --oc-dur-h in index.html
+-  const DUR_W = 520;
+-  const DUR_H = 480;
++  const DUR_W = 340;
++  const DUR_H = 360;
++  const DUR_ASK = 340;
+ 
+   const shell = document.getElementById('ocShell');
+   const tab = document.getElementById('commandTab');
+@@ -96,11 +97,12 @@
+ 
+   let lastAssistantText = '';
+   let lastAssistantAt = 0;
++  let userMessageCount = 0;
+ 
+   function addMessage(text, type = 'user', skipPersist = false) {
+     const t = String(text || '').trim();
+     if (!t) return;
+-    // Drop duplicate assistant bubbles from dual IPC paths / double broadcast
++    // Drop duplicate assistant replies from dual IPC paths / double broadcast
+     if (type === 'assistant') {
+       const now = Date.now();
+       if (t === lastAssistantText && now - lastAssistantAt < 5000) return;
+@@ -109,14 +111,15 @@
+     }
+     const messageDiv = document.createElement('div');
+     messageDiv.className = `message ${type}`;
+-    const timeDiv = document.createElement('div');
+-    timeDiv.className = 'message-time';
+-    timeDiv.textContent = new Date().toLocaleTimeString();
++    if (type === 'user') {
++      userMessageCount += 1;
++      if (userMessageCount === 1) messageDiv.classList.add('is-first');
++    }
+     const textDiv = document.createElement('div');
+     textDiv.className = 'message-text';
+-    if (type === 'assistant') textDiv.innerHTML = formatMarkdown(t);
++    // Assistant: print-style markdown (no bubble). User: plain text inside bubble.
++    if (type === 'assistant' || type === 'system') textDiv.innerHTML = formatMarkdown(t);
+     else textDiv.textContent = t;
+-    messageDiv.appendChild(timeDiv);
+     messageDiv.appendChild(textDiv);
+     messagesEl.appendChild(messageDiv);
+     messagesEl.scrollTop = messagesEl.scrollHeight;
+@@ -126,19 +129,26 @@
+     }
+   }
+ 
++  function setThinkingChrome(on) {
++    shell.classList.toggle('is-thinking', Boolean(on));
++  }
++
+   function showThinking() {
+     hideThinking();
++    setThinkingChrome(true);
+     const thinkingDiv = document.createElement('div');
+     thinkingDiv.className = 'message assistant thinking';
+     thinkingDiv.id = 'bar-thinking';
+     thinkingDiv.innerHTML =
+-      '<div class="message-time">…</div><div class="message-text thinking-dots"><span class="dot">•</span><span class="dot">•</span><span class="dot">•</span></div>';
++      '<div class="thinking-row"><span class="thinking-dots"><span class="dot">•</span><span class="dot">•</span><span class="dot">•</span></span><span>Thinking</span></div>';
+     messagesEl.appendChild(thinkingDiv);
+     messagesEl.scrollTop = messagesEl.scrollHeight;
+   }
+ 
+   function hideThinking() {
+     document.getElementById('bar-thinking')?.remove();
++    // Keep glow if another in-flight request left a pending state; cleared on response.
++    if (!document.getElementById('bar-thinking')) setThinkingChrome(false);
+   }
+ 
+   function measureShell() {
+@@ -254,30 +264,44 @@
+     try {
+       const from = measureShell();
+ 
+-      // 1) Expand width outwards — keep pill chrome until chat opens
+-      wide = true;
+-      shell.classList.add('is-wide');
+-      notifyDrawer(true, { recenter: false });
+-      await animateBounds(from.width, from.height, EXPANDED_W, COLLAPSED_H, DUR_W, {
+-        recenterDuring: 'x',
+-      });
+-
+-      // 2) Then expand chat smoothly downward (CSS height + Electron bounds in lockstep)
+-      open = true;
+-      shell.classList.add('is-chat-open');
+-      drawer.setAttribute('aria-hidden', 'false');
+-      setModeUI(nextMode);
+-      updateCloseIcon();
+-      await animateBounds(EXPANDED_W, COLLAPSED_H, EXPANDED_W, COLLAPSED_H + DRAWER_H, DUR_H, {
+-        recenterDuring: false,
+-      });
++      // Ask: one-shot fade + expand downward — no staged delay / no vertical jump.
++      if (nextMode === 'ask') {
++        wide = true;
++        open = true;
++        shell.classList.add('is-wide', 'is-chat-open', 'is-ask-fade');
++        drawer.setAttribute('aria-hidden', 'false');
++        setModeUI(nextMode);
++        updateCloseIcon();
++        notifyDrawer(true, { recenter: false });
++        await animateBounds(from.width, from.height, EXPANDED_W, COLLAPSED_H + DRAWER_H, DUR_ASK, {
++          recenterDuring: 'x',
++        });
++        shell.classList.remove('is-ask-fade');
++      } else {
++        // Auto / other: still expand down only (width then height), top edge pinned by main.
++        wide = true;
++        shell.classList.add('is-wide');
++        notifyDrawer(true, { recenter: false });
++        await animateBounds(from.width, from.height, EXPANDED_W, COLLAPSED_H, DUR_W, {
++          recenterDuring: 'x',
++        });
++        open = true;
++        shell.classList.add('is-chat-open');
++        drawer.setAttribute('aria-hidden', 'false');
++        setModeUI(nextMode);
++        updateCloseIcon();
++        await animateBounds(EXPANDED_W, COLLAPSED_H, EXPANDED_W, COLLAPSED_H + DRAWER_H, DUR_H, {
++          recenterDuring: false,
++        });
++      }
+     } finally {
+       shell.classList.remove('is-animating');
+       animating = false;
+     }
+ 
+     if (nextMode === 'ask') {
+-      setTimeout(() => inputEl?.focus(), 40);
++      // Focus immediately — no artificial delay.
++      inputEl?.focus();
+     }
+   }
+ 
+@@ -371,9 +395,20 @@
+     }
+   }
+ 
++
++  function applyThemeFromSystem() {
++    try {
++      const dark = typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches;
++      document.documentElement.classList.toggle('oc-dark', dark && !stealthOn);
++    } catch (_) {
++      /* ignore */
++    }
++  }
++
+   function applyStealthUI(enabled, { persist = true, notifyMain = true } = {}) {
+     stealthOn = Boolean(enabled);
+     document.documentElement.classList.toggle('oc-stealth', stealthOn);
++    applyThemeFromSystem();
+     stealthWrap?.classList.toggle('is-on', stealthOn);
+     if (stealthSwitch) {
+       stealthSwitch.setAttribute('aria-checked', stealthOn ? 'true' : 'false');
+@@ -586,9 +621,12 @@
+     autoGrow();
+     showThinking();
+     try {
++      const screenAsk = /\b(what('?s| is) on (my )?screen|on my screen|look at (my )?screen|what do you see|describe (the |my )?(screen|desktop)|screenshot)\b/i.test(text);
++      if (screenAsk) void window.electronAPI?.visualScan?.start?.();
+       await window.electronAPI?.sendChatMessage?.(text);
+     } catch (error) {
+       hideThinking();
++      setThinkingChrome(false);
+       addMessage(`Failed to send: ${error.message}`, 'error');
+     }
+   }
+@@ -598,6 +636,8 @@
+     addMessage('Auto Answer — reading your screen…', 'system');
+     showThinking();
+     try {
++      // Premium Visual Intelligence scan (fire-and-forget; main also triggers).
++      void window.electronAPI?.visualScan?.start?.();
+       // Prefer dedicated control endpoint when available
+       const res = await fetch('http://127.0.0.1:3847/auto-answer', {
+         method: 'POST',
+@@ -631,7 +671,8 @@
+       inputEl?.focus();
+       return;
+     }
+-    await expandToChat('ask');
++    // Immediate fade-down — do not queue behind boot delays.
++    void expandToChat('ask');
+   });
+ 
+   autoBtn?.addEventListener('click', async (e) => {
+@@ -756,6 +797,7 @@
+   if (api) {
+     api.onTranscriptionLlmResponse?.((_e, data) => {
+       hideThinking();
++      setThinkingChrome(false);
+       const text = data?.response || data?.text || '';
+       if (text) {
+         if (!open) expandToChat(mode || 'ask');
+@@ -766,6 +808,7 @@
+     api.onTranscriptionLlmResponseStart?.(() => {
+       if (!open) expandToChat(mode || 'ask');
+       showThinking();
++      setThinkingChrome(true);
+     });
+     // Fallback only when transcription channel is unavailable
+     if (typeof api.onTranscriptionLlmResponse !== 'function') {
+@@ -784,6 +827,7 @@
+     });
+     api.onSessionCleared?.(() => {
+       history = [];
++      userMessageCount = 0;
+       messagesEl.innerHTML = '';
+       addMessage(GREETING, 'assistant', true);
+       history = [{ type: 'assistant', text: GREETING }];
+@@ -841,6 +885,12 @@
+     stealthOn = false;
+   }
+   applyStealthUI(stealthOn, { persist: false, notifyMain: true });
++  applyThemeFromSystem();
++  try {
++    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyThemeFromSystem);
++  } catch (_) {
++    /* ignore */
++  }
+ 
+   (async () => {
+     let defer = false;
+diff --git a/src/App.tsx b/src/App.tsx
+index a4af56b..8aba93f 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1221,12 +1221,20 @@ function extractYoutubeUrl(text: string): string | null {
+   return raw.startsWith("http") ? raw : `https://${raw}`;
+ }
+ 
++function looksLikeScreenContextQuery(text: string): boolean {
++  return /\b(what('?s| is) on (my )?screen|see (my )?screen|look at (my )?screen|on my screen|what (am i|is) (looking at|viewing)|describe (the |my )?(screen|page|window|desktop)|screenshot|what do you see|can you see)\b/i.test(
++    text,
++  );
++}
++
+ function looksLikeWebSearchQuery(text: string): boolean {
+   const t = text.trim();
+   if (!t) return false;
++  if (looksLikeScreenContextQuery(t)) return false;
+   const yt = extractYoutubeUrl(t);
+   const withoutYt = yt ? t.replace(yt, "").trim() : t;
+   if (!withoutYt) return false;
++  // Explicit research intent only — casual "what's…" questions stay local.
+   return (
+     /^(?:search|look\s*up|find|research|google)\b/i.test(withoutYt) ||
+     /\b(?:search the web|look online|from the (?:web|internet)|web search)\b/i.test(
+@@ -1234,8 +1242,7 @@ function looksLikeWebSearchQuery(text: string): boolean {
+     ) ||
+     /\b(?:latest|current|today'?s|this week'?s|breaking)\b.+\b(?:news|price|score|release|update|headline)s?\b/i.test(
+       withoutYt,
+-    ) ||
+-    /^(?:what(?:'| i)?s|who is|when (?:did|is|was)|how many)\b.+/i.test(withoutYt)
++    )
+   );
+ }
+ 
+-- 
+2.43.0
+

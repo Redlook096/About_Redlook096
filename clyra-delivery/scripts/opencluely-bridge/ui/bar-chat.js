@@ -1,0 +1,933 @@
+/**
+ * Light frosted OpenCluely bar:
+ *  - Ask → expand width then chat (normal Q&A)
+ *  - Auto Answer → expand + screenshot vision with initiative
+ *  - X collapses back to the compact pill
+ *  - Drag handle moves the whole window; opens centered at top
+ */
+(function () {
+  const HISTORY_KEY = 'opencluely_bar_chat_v2';
+  const GREETING = 'Hi, how can I help you?';
+  const EXPANDED_W = 560;
+  const COLLAPSED_H = 52;
+  const DRAWER_H = 340;
+  // Keep in sync with --oc-dur-w / --oc-dur-h in index.html
+  const DUR_W = 340;
+  const DUR_H = 360;
+  const DUR_ASK = 340;
+
+  const shell = document.getElementById('ocShell');
+  const tab = document.getElementById('commandTab');
+  const drawer = document.getElementById('chatDrawer');
+  const messagesEl = document.getElementById('barChatMessages');
+  const inputEl = document.getElementById('barChatInput');
+  const sendBtn = document.getElementById('barChatSend');
+  const closeBtn = document.getElementById('ocCloseBtn');
+  const askBtn = document.getElementById('ocAskBtn');
+  const autoBtn = document.getElementById('ocAutoBtn');
+  const controlBtn = document.getElementById('ocControlBtn');
+  const stealthWrap = document.getElementById('ocStealthWrap');
+  const stealthSwitch = document.getElementById('ocStealthSwitch');
+  const modeLabel = document.getElementById('chatModeLabel');
+  const modeHint = document.getElementById('chatModeHint');
+
+  if (!shell || !drawer || !messagesEl) {
+    console.warn('[BarChat] missing shell elements');
+    return;
+  }
+
+  let open = false;
+  let wide = false;
+  let mode = 'ask'; // 'ask' | 'auto' | 'control'
+  let history = [];
+  let animating = false;
+  let controlling = false;
+  let taskPromptMode = false;
+  let stealthOn = false;
+  const STEALTH_KEY = 'opencluely_stealth_v1';
+
+  const AUTO_PROMPT =
+    "Look at what's on my screen right now. Use your initiative: if there is a question, quiz, problem, coding prompt, form field, or anything the user likely needs answered or solved, answer it directly and helpfully. If there is no clear question, briefly say what you see and the most useful next step. Read text literally; do not invent content that is not visible.";
+
+  function loadHistory() {
+    messagesEl.innerHTML = '';
+    history = [];
+    // One clean greeting only — never replay old spam from previous sessions.
+    try {
+      localStorage.removeItem('opencluely_bar_chat_v1');
+      localStorage.removeItem(HISTORY_KEY);
+    } catch (_) {
+      /* ignore */
+    }
+    addMessage(GREETING, 'assistant', true);
+    history = [{ type: 'assistant', text: GREETING }];
+    saveHistory();
+  }
+
+  function updateCloseIcon() {
+    if (!closeBtn) return;
+    const collapseMode = open || taskPromptMode;
+    closeBtn.classList.toggle('is-collapse', collapseMode);
+    if (collapseMode) {
+      closeBtn.title = 'Collapse chat';
+      closeBtn.setAttribute('aria-label', 'Collapse chat');
+    } else {
+      closeBtn.title = 'Close';
+      closeBtn.setAttribute('aria-label', 'Close');
+    }
+  }
+
+  function saveHistory() {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-80)));
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function formatMarkdown(text) {
+    return String(text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/`(.+?)`/g, '<code>$1</code>')
+      .replace(/\n/g, '<br>');
+  }
+
+  let lastAssistantText = '';
+  let lastAssistantAt = 0;
+  let userMessageCount = 0;
+
+  function addMessage(text, type = 'user', skipPersist = false) {
+    const t = String(text || '').trim();
+    if (!t) return;
+    // Drop duplicate assistant replies from dual IPC paths / double broadcast
+    if (type === 'assistant') {
+      const now = Date.now();
+      if (t === lastAssistantText && now - lastAssistantAt < 5000) return;
+      lastAssistantText = t;
+      lastAssistantAt = now;
+    }
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `message ${type}`;
+    if (type === 'user') {
+      userMessageCount += 1;
+      if (userMessageCount === 1) messageDiv.classList.add('is-first');
+    }
+    const textDiv = document.createElement('div');
+    textDiv.className = 'message-text';
+    // Assistant: print-style markdown (no bubble). User: plain text inside bubble.
+    if (type === 'assistant' || type === 'system') textDiv.innerHTML = formatMarkdown(t);
+    else textDiv.textContent = t;
+    messageDiv.appendChild(textDiv);
+    messagesEl.appendChild(messageDiv);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (!skipPersist) {
+      history.push({ type, text: t });
+      saveHistory();
+    }
+  }
+
+  function setThinkingChrome(on) {
+    shell.classList.toggle('is-thinking', Boolean(on));
+  }
+
+  function showThinking() {
+    hideThinking();
+    setThinkingChrome(true);
+    const thinkingDiv = document.createElement('div');
+    thinkingDiv.className = 'message assistant thinking';
+    thinkingDiv.id = 'bar-thinking';
+    thinkingDiv.innerHTML =
+      '<div class="thinking-row"><span class="thinking-dots"><span class="dot">•</span><span class="dot">•</span><span class="dot">•</span></span><span>Thinking</span></div>';
+    messagesEl.appendChild(thinkingDiv);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function hideThinking() {
+    document.getElementById('bar-thinking')?.remove();
+    // Keep glow if another in-flight request left a pending state; cleared on response.
+    if (!document.getElementById('bar-thinking')) setThinkingChrome(false);
+  }
+
+  function measureShell() {
+    const rect = shell.getBoundingClientRect();
+    return {
+      width: Math.max(220, Math.ceil(rect.width)),
+      height: Math.max(COLLAPSED_H, Math.ceil(rect.height)),
+    };
+  }
+
+  let lastResize = { w: 0, h: 0 };
+  let resizeChain = Promise.resolve();
+  let queuedResize = null;
+
+  // Match CSS --oc-ease: cubic-bezier(0.16, 1, 0.3, 1) so Electron bounds
+  // and drawer height stay locked during expand/collapse.
+  function cubicBezierEase(t, p1x = 0.16, p1y = 1, p2x = 0.3, p2y = 1) {
+    const x = Math.max(0, Math.min(1, t));
+    // Solve Bézier x(u)=x for u via Newton, then evaluate y(u).
+    let u = x;
+    for (let i = 0; i < 6; i++) {
+      const u2 = u * u;
+      const u3 = u2 * u;
+      const cx = 3 * p1x;
+      const bx = 3 * (p2x - p1x) - cx;
+      const ax = 1 - cx - bx;
+      const xu = ax * u3 + bx * u2 + cx * u;
+      const dx = 3 * ax * u2 + 2 * bx * u + cx;
+      if (Math.abs(dx) < 1e-6) break;
+      u -= (xu - x) / dx;
+      u = Math.max(0, Math.min(1, u));
+    }
+    const u2 = u * u;
+    const u3 = u2 * u;
+    const cy = 3 * p1y;
+    const by = 3 * (p2y - p1y) - cy;
+    const ay = 1 - cy - by;
+    return ay * u3 + by * u2 + cy * u;
+  }
+
+  function resizeWindowNow(width, height, { recenter = false } = {}) {
+    if (!window.electronAPI?.resizeWindow) return Promise.resolve();
+    const w = Math.max(60, Math.round(width));
+    const h = Math.max(28, Math.round(height));
+    // Coalesce: keep only the latest size so rAF never waits on a backlog of IPC.
+    queuedResize = { w, h, recenter };
+    resizeChain = resizeChain
+      .catch(() => {})
+      .then(async () => {
+        while (queuedResize) {
+          const job = queuedResize;
+          queuedResize = null;
+          if (
+            Math.abs(job.w - lastResize.w) < 1 &&
+            Math.abs(job.h - lastResize.h) < 1 &&
+            job.recenter !== true &&
+            job.recenter !== 'x'
+          ) {
+            continue;
+          }
+          lastResize = { w: job.w, h: job.h };
+          await window.electronAPI.resizeWindow(job.w, job.h, { recenter: job.recenter });
+        }
+      });
+    return resizeChain;
+  }
+
+  async function measureAndResize({ recenter = false } = {}) {
+    await new Promise((r) => requestAnimationFrame(r));
+    const { width, height } = measureShell();
+    await resizeWindowNow(width, height, { recenter });
+  }
+
+  /**
+   * Drive Electron window bounds in lockstep with CSS (single rAF, awaited IPC).
+   * recenter: false | 'x' (keep Y, center horizontally) | true (center at top)
+   */
+  async function animateBounds(fromW, fromH, toW, toH, durationMs, { recenterDuring = false } = {}) {
+    const start = performance.now();
+    const dw = Math.abs(toW - fromW);
+    const dh = Math.abs(toH - fromH);
+    // Prefer reduced motion or no-op deltas: snap once.
+    const reduce =
+      typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce || durationMs <= 0 || (dw < 2 && dh < 2)) {
+      await resizeWindowNow(toW, toH, {
+        recenter: recenterDuring === 'x' || dw > 2 ? 'x' : false,
+      });
+      return;
+    }
+    // rAF-driven; coalesce IPC to latest size. Recenter only on the final frame
+    // so we don't pay centerMainWindowHorizontally on every tick.
+    while (true) {
+      const t = Math.min(1, (performance.now() - start) / durationMs);
+      const e = cubicBezierEase(t);
+      const w = Math.round(fromW + (toW - fromW) * e);
+      const h = Math.round(fromH + (toH - fromH) * e);
+      void resizeWindowNow(w, h, { recenter: false });
+      if (t >= 1) break;
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+    await resizeWindowNow(toW, toH, {
+      recenter: recenterDuring === 'x' || dw > 2 ? 'x' : false,
+    });
+  }
+
+  async function expandToChat(nextMode) {
+    if (animating) return;
+    animating = true;
+    shell.classList.add('is-animating');
+    mode = nextMode;
+
+    try {
+      const from = measureShell();
+
+      // Ask: one-shot fade + expand downward — no staged delay / no vertical jump.
+      if (nextMode === 'ask') {
+        wide = true;
+        open = true;
+        shell.classList.add('is-wide', 'is-chat-open', 'is-ask-fade');
+        drawer.setAttribute('aria-hidden', 'false');
+        setModeUI(nextMode);
+        updateCloseIcon();
+        notifyDrawer(true, { recenter: false });
+        await animateBounds(from.width, from.height, EXPANDED_W, COLLAPSED_H + DRAWER_H, DUR_ASK, {
+          recenterDuring: 'x',
+        });
+        shell.classList.remove('is-ask-fade');
+      } else {
+        // Auto / other: still expand down only (width then height), top edge pinned by main.
+        wide = true;
+        shell.classList.add('is-wide');
+        notifyDrawer(true, { recenter: false });
+        await animateBounds(from.width, from.height, EXPANDED_W, COLLAPSED_H, DUR_W, {
+          recenterDuring: 'x',
+        });
+        open = true;
+        shell.classList.add('is-chat-open');
+        drawer.setAttribute('aria-hidden', 'false');
+        setModeUI(nextMode);
+        updateCloseIcon();
+        await animateBounds(EXPANDED_W, COLLAPSED_H, EXPANDED_W, COLLAPSED_H + DRAWER_H, DUR_H, {
+          recenterDuring: false,
+        });
+      }
+    } finally {
+      shell.classList.remove('is-animating');
+      animating = false;
+    }
+
+    if (nextMode === 'ask') {
+      // Focus immediately — no artificial delay.
+      inputEl?.focus();
+    }
+  }
+
+  async function collapse(opts = {}) {
+    const hideIfAlreadyCollapsed = Boolean(opts.hideIfAlreadyCollapsed);
+    // Wait briefly if an expand is mid-flight so close isn't dropped
+    if (animating) {
+      const start = performance.now();
+      while (animating && performance.now() - start < 1600) {
+        await wait(32);
+      }
+    }
+    if (animating) return;
+    if (!open && !wide && !taskPromptMode && !controlling) {
+      if (hideIfAlreadyCollapsed) {
+        try {
+          await window.electronAPI?.hideAllWindows?.();
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      return;
+    }
+    animating = true;
+    shell.classList.add('is-animating');
+    askBtn?.classList.remove('is-active');
+    autoBtn?.classList.remove('is-active');
+
+    try {
+      // Exit control compose without leaving a half-open shell
+      if (taskPromptMode) {
+        taskPromptMode = false;
+        shell.classList.remove('is-control-compose', 'is-task-prompt');
+        clearInlineControlInput();
+        updateCloseIcon();
+      }
+
+      const from = measureShell();
+
+      // 1) Collapse height first — drop is-chat-open so CSS height eases with the window
+      open = false;
+      shell.classList.remove('is-chat-open');
+      drawer.setAttribute('aria-hidden', 'true');
+      updateCloseIcon();
+      await animateBounds(from.width, from.height, EXPANDED_W, COLLAPSED_H, DUR_H, {
+        recenterDuring: false,
+      });
+
+      // 2) Then shrink width back to pill
+      wide = false;
+      shell.classList.remove('is-wide');
+      notifyDrawer(false, { recenter: false });
+      // Measure pill target after width class removed
+      await new Promise((r) => requestAnimationFrame(r));
+      const pill = tab ? tab.getBoundingClientRect() : measureShell();
+      const pillW = Math.max(220, Math.ceil(pill.width || 320));
+      await animateBounds(EXPANDED_W, COLLAPSED_H, pillW, COLLAPSED_H, DUR_W, {
+        recenterDuring: 'x',
+      });
+      await resizeWindowNow(pillW, COLLAPSED_H, { recenter: true });
+      updateCloseIcon();
+    } finally {
+      shell.classList.remove('is-animating');
+      animating = false;
+    }
+  }
+
+  function notifyDrawer(openState, opts = {}) {
+    try {
+      window.electronAPI?.setChatDrawerOpen?.(openState, opts);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function setModeUI(next) {
+    mode = next;
+    askBtn?.classList.toggle('is-active', mode === 'ask' && open && !controlling);
+    autoBtn?.classList.toggle('is-active', mode === 'auto' && open && !controlling);
+    if (modeLabel) {
+      modeLabel.textContent =
+        mode === 'auto' ? 'Auto Answer' : mode === 'control' ? 'Take Control' : 'Ask';
+    }
+    if (modeHint) {
+      modeHint.textContent =
+        mode === 'auto'
+          ? 'Reading your screen…'
+          : mode === 'control'
+            ? 'Describe the task for the AI…'
+            : 'Type a question…';
+    }
+  }
+
+
+  function applyThemeFromSystem() {
+    try {
+      const dark = typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.classList.toggle('oc-dark', dark && !stealthOn);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function applyStealthUI(enabled, { persist = true, notifyMain = true } = {}) {
+    stealthOn = Boolean(enabled);
+    document.documentElement.classList.toggle('oc-stealth', stealthOn);
+    applyThemeFromSystem();
+    stealthWrap?.classList.toggle('is-on', stealthOn);
+    if (stealthSwitch) {
+      stealthSwitch.setAttribute('aria-checked', stealthOn ? 'true' : 'false');
+    }
+    if (persist) {
+      try {
+        localStorage.setItem(STEALTH_KEY, stealthOn ? '1' : '0');
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    if (notifyMain) {
+      try {
+        window.electronAPI?.setStealthMode?.(stealthOn);
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  let activateAnimating = false;
+
+  async function runBootAnimation() {
+    if (activateAnimating) return;
+    activateAnimating = true;
+    try {
+      // Reset any prior reveal so re-activation can replay the sequence.
+      shell.classList.remove(
+        'is-boot-fade',
+        'is-boot-expand',
+        'is-boot-reveal',
+        'is-wide',
+        'is-chat-open',
+        'is-control-compose',
+      );
+      open = false;
+      wide = false;
+      taskPromptMode = false;
+      drawer.setAttribute('aria-hidden', 'true');
+      updateCloseIcon();
+
+      // 1) Start squished + invisible
+      shell.classList.add('is-boot-squish');
+      // Fit Electron window to thin pill first
+      if (window.electronAPI?.resizeWindow) {
+        await window.electronAPI.resizeWindow(56, COLLAPSED_H);
+      }
+      await wait(60);
+      // 2) Fade in while still thin / compressed
+      shell.classList.add('is-boot-fade');
+      await wait(360);
+      // 3) Expand horizontally into full pill
+      shell.classList.remove('is-boot-squish');
+      shell.classList.add('is-boot-expand');
+      await wait(50);
+      await measureAndResize({ recenter: 'x' });
+      await wait(520);
+      // 4) Reveal buttons / stealth / drag with stagger
+      unlockInteractiveTargets();
+      await wait(520);
+      shell.classList.remove('is-boot-fade', 'is-boot-expand');
+      await measureAndResize({ recenter: 'x' });
+    } finally {
+      activateAnimating = false;
+    }
+  }
+
+  function setControlButtonState(isControlling) {
+    controlling = Boolean(isControlling);
+    shell.classList.toggle('is-controlling', controlling);
+    if (!controlBtn) return;
+    if (controlling) {
+      controlBtn.classList.add('oc-stop');
+      controlBtn.classList.remove('oc-control');
+      controlBtn.title = 'Stop AI control';
+      controlBtn.setAttribute('aria-label', 'Stop AI control');
+      // Keep Stop visible inside the collapsed pill; hide other actions via CSS
+      controlBtn.style.display = '';
+    } else {
+      controlBtn.classList.add('oc-control');
+      controlBtn.classList.remove('oc-stop');
+      controlBtn.title = 'Let OpenCluely control your machine';
+      controlBtn.setAttribute('aria-label', 'Take Control');
+    }
+  }
+
+  function inlineControlInput() {
+    return document.getElementById('ocInlineControlInput');
+  }
+
+  function clearInlineControlInput() {
+    const el = inlineControlInput();
+    if (el) el.value = '';
+  }
+
+  async function enterTaskPrompt() {
+    if (controlling) return;
+    if (animating) {
+      const start = performance.now();
+      while (animating && performance.now() - start < 1600) {
+        await wait(32);
+      }
+    }
+    if (animating || controlling) return;
+    animating = true;
+    setModeUI('control');
+    // Stay on the original collapsed pill — hide buttons, reveal type space.
+    taskPromptMode = true;
+    open = false;
+    wide = false;
+    shell.classList.remove('is-chat-open', 'is-wide', 'is-task-prompt', 'is-fading-out', 'is-fading-in', 'is-shaking');
+    shell.classList.add('is-control-compose');
+    drawer.setAttribute('aria-hidden', 'true');
+    updateCloseIcon();
+    const el = inlineControlInput();
+    let placeholder = 'What should the AI do on your computer?';
+    try {
+      const status = await window.electronAPI?.getDesktopControlStatus?.();
+      if (status && status.driver === 'none') {
+        placeholder =
+          status.platform === 'linux'
+            ? 'Install xdotool to enable Take Control on Linux'
+            : status.platform === 'darwin'
+              ? 'Enable Accessibility for OpenCluely in System Settings'
+              : 'Desktop control driver unavailable on this system';
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    if (el) {
+      el.value = '';
+      el.placeholder = placeholder;
+      setTimeout(() => el.focus(), 30);
+    }
+    notifyDrawer(false, { recenter: false });
+    await measureAndResize({ recenter: false });
+    await wait(120);
+    animating = false;
+  }
+
+  async function exitTaskPromptToControl(task) {
+    animating = true;
+    taskPromptMode = false;
+    shell.classList.remove('is-control-compose', 'is-task-prompt', 'is-fading-out', 'is-fading-in');
+    // Stay collapsed — only Stop remains visible via is-controlling
+    open = false;
+    wide = false;
+    shell.classList.remove('is-chat-open', 'is-wide');
+    drawer.setAttribute('aria-hidden', 'true');
+    setControlButtonState(true);
+    setModeUI('control');
+    updateCloseIcon();
+    clearInlineControlInput();
+    const status = document.getElementById('ocControlStatus');
+    if (status) status.textContent = 'AI controlling…';
+    measureAndResize();
+    try {
+      await window.electronAPI?.startDesktopControl?.(task);
+    } catch (error) {
+      setControlButtonState(false);
+      if (status) status.textContent = '';
+      shell.classList.add('is-control-compose');
+      taskPromptMode = true;
+      const el = inlineControlInput();
+      if (el) {
+        el.value = '';
+        el.placeholder = `Failed: ${error.message}`;
+      }
+    }
+    await wait(80);
+    animating = false;
+  }
+
+  async function stopControlFromBar() {
+    hideThinking();
+    try {
+      await window.electronAPI?.stopDesktopControl?.();
+    } catch (_) {
+      /* ignore */
+    }
+    setControlButtonState(false);
+    const status = document.getElementById('ocControlStatus');
+    if (status) status.textContent = '';
+    shell.classList.remove('is-control-compose', 'is-task-prompt');
+    taskPromptMode = false;
+    updateCloseIcon();
+    measureAndResize();
+    if (modeHint) modeHint.textContent = 'Control ended';
+  }
+
+  function wait(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  async function sendCurrent() {
+    const text = (inputEl?.value || '').trim();
+    const inlineText = (inlineControlInput()?.value || '').trim();
+    if (taskPromptMode) {
+      const task = inlineText || text;
+      if (!task) return;
+      clearInlineControlInput();
+      if (inputEl) inputEl.value = '';
+      await exitTaskPromptToControl(task);
+      return;
+    }
+    if (!text) return;
+    if (!open) await expandToChat('ask');
+    addMessage(text, 'user');
+    inputEl.value = '';
+    autoGrow();
+    showThinking();
+    try {
+      const screenAsk = /\b(what('?s| is) on (my )?screen|on my screen|look at (my )?screen|what do you see|describe (the |my )?(screen|desktop)|screenshot)\b/i.test(text);
+      if (screenAsk) void window.electronAPI?.visualScan?.start?.();
+      await window.electronAPI?.sendChatMessage?.(text);
+    } catch (error) {
+      hideThinking();
+      setThinkingChrome(false);
+      addMessage(`Failed to send: ${error.message}`, 'error');
+    }
+  }
+
+  async function runAutoAnswer() {
+    await expandToChat('auto');
+    addMessage('Auto Answer — reading your screen…', 'system');
+    showThinking();
+    try {
+      // Premium Visual Intelligence scan (fire-and-forget; main also triggers).
+      void window.electronAPI?.visualScan?.start?.();
+      // Prefer dedicated control endpoint when available
+      const res = await fetch('http://127.0.0.1:3847/auto-answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: AUTO_PROMPT }),
+      });
+      if (!res.ok) {
+        // Fallback: chat path that triggers screenshot vision
+        await window.electronAPI?.sendChatMessage?.(AUTO_PROMPT);
+      }
+    } catch (_) {
+      try {
+        await window.electronAPI?.sendChatMessage?.(AUTO_PROMPT);
+      } catch (error) {
+        hideThinking();
+        addMessage(`Auto Answer failed: ${error.message}`, 'error');
+      }
+    }
+  }
+
+  function autoGrow() {
+    if (!inputEl) return;
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 96) + 'px';
+  }
+
+  // Buttons
+  askBtn?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    if (open && mode === 'ask') {
+      inputEl?.focus();
+      return;
+    }
+    // Immediate fade-down — do not queue behind boot delays.
+    void expandToChat('ask');
+  });
+
+  autoBtn?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await runAutoAnswer();
+  });
+
+  controlBtn?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    if (controlling) {
+      await stopControlFromBar();
+      return;
+    }
+    await enterTaskPrompt();
+  });
+
+  const toggleStealth = (e) => {
+    try {
+      e?.preventDefault?.();
+      e?.stopPropagation?.();
+    } catch (_) {
+      /* ignore */
+    }
+    // Ignore non-primary buttons; avoid double-toggle from nested bubble.
+    if (e?.button != null && e.button !== 0) return;
+    applyStealthUI(!stealthOn);
+    measureAndResize();
+  };
+  // Single pointerup on the wrap only — pointerdown+click on wrap+switch
+  // was double-firing and cancelling the toggle (looked "broken").
+  stealthWrap?.addEventListener('pointerup', toggleStealth);
+  try {
+    if (stealthWrap) {
+      stealthWrap.style.pointerEvents = 'auto';
+      stealthWrap.style.webkitAppRegion = 'no-drag';
+    }
+    if (stealthSwitch) {
+      stealthSwitch.style.pointerEvents = 'auto';
+      stealthSwitch.style.webkitAppRegion = 'no-drag';
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  function unlockInteractiveTargets() {
+    shell.classList.add('is-boot-reveal');
+    for (const el of shell.querySelectorAll('.oc-boot-hide, .oc-stealth-wrap, .oc-actions, .oc-close')) {
+      try {
+        el.style.pointerEvents = 'auto';
+        el.style.webkitAppRegion = 'no-drag';
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  closeBtn?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    if (taskPromptMode) {
+      taskPromptMode = false;
+      shell.classList.remove('is-control-compose', 'is-task-prompt', 'is-wide', 'is-fading-in', 'is-fading-out');
+      open = false;
+      wide = false;
+      clearInlineControlInput();
+      if (inputEl) inputEl.placeholder = 'Type a message… (Shift+Enter for newline)';
+      notifyDrawer(false);
+      updateCloseIcon();
+      measureAndResize();
+      return;
+    }
+    // Chat open → chevron collapses chat (does not hide the pill)
+    if (open || wide) {
+      if (controlling) await stopControlFromBar();
+      await collapse({ hideIfAlreadyCollapsed: false });
+      return;
+    }
+    if (controlling) {
+      await stopControlFromBar();
+      return;
+    }
+    // Fully collapsed X → hide overlay
+    await collapse({ hideIfAlreadyCollapsed: true });
+  });
+
+  sendBtn?.addEventListener('click', () => sendCurrent());
+  inputEl?.addEventListener('input', autoGrow);
+  inputEl?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendCurrent();
+    }
+  });
+
+  const inlineEl = inlineControlInput();
+  inlineEl?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      sendCurrent();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeBtn?.click();
+    }
+  });
+  inlineEl?.addEventListener('mousedown', (e) => e.stopPropagation());
+  inlineEl?.addEventListener('pointerdown', (e) => e.stopPropagation());
+
+  // Main-process open/close (single listener — avoid double collapse/hide)
+  function onDrawerToggle(_event, payload) {
+    if (payload && typeof payload.open === 'boolean') {
+      if (payload.open) expandToChat(mode || 'ask');
+      else collapse({ hideIfAlreadyCollapsed: false });
+    }
+  }
+  if (window.electronAPI?.onToggleChatDrawer) {
+    window.electronAPI.onToggleChatDrawer(onDrawerToggle);
+  } else {
+    window.electronAPI?.receive?.('toggle-chat-drawer', onDrawerToggle);
+  }
+
+  // Responses — prefer transcription-llm-response only (main also used to
+  // broadcast llm-response for the same reply, which doubled bubbles).
+  const api = window.electronAPI;
+  if (api) {
+    api.onTranscriptionLlmResponse?.((_e, data) => {
+      hideThinking();
+      setThinkingChrome(false);
+      const text = data?.response || data?.text || '';
+      if (text) {
+        if (!open) expandToChat(mode || 'ask');
+        addMessage(text, 'assistant');
+        if (modeHint && mode === 'auto') modeHint.textContent = 'Answer ready';
+      }
+    });
+    api.onTranscriptionLlmResponseStart?.(() => {
+      if (!open) expandToChat(mode || 'ask');
+      showThinking();
+      setThinkingChrome(true);
+    });
+    // Fallback only when transcription channel is unavailable
+    if (typeof api.onTranscriptionLlmResponse !== 'function') {
+      api.onLlmResponse?.((_e, data) => {
+        hideThinking();
+        const text = data?.response || data?.text || '';
+        if (text) {
+          if (!open) expandToChat(mode || 'ask');
+          addMessage(text, 'assistant');
+        }
+      });
+    }
+    api.onOcrError?.((_e, data) => {
+      hideThinking();
+      addMessage(data?.error || 'Screenshot failed', 'error');
+    });
+    api.onSessionCleared?.(() => {
+      history = [];
+      userMessageCount = 0;
+      messagesEl.innerHTML = '';
+      addMessage(GREETING, 'assistant', true);
+      history = [{ type: 'assistant', text: GREETING }];
+      saveHistory();
+    });
+    api.onControlStatus?.((_e, data) => {
+      hideThinking();
+      const status = document.getElementById('ocControlStatus');
+      if (data?.status === 'running') {
+        setControlButtonState(true);
+        if (status) status.textContent = data.message || 'AI controlling…';
+      } else if (data?.status === 'step' && data.message) {
+        if (status) status.textContent = String(data.message).slice(0, 72);
+      } else if (data?.status === 'done') {
+        setControlButtonState(false);
+        if (status) status.textContent = '';
+      } else if (data?.status === 'stopped') {
+        setControlButtonState(false);
+        if (status) status.textContent = '';
+      } else if (data?.status === 'error') {
+        setControlButtonState(false);
+        if (status) status.textContent = String(data.message || 'Control error').slice(0, 72);
+      }
+    });
+    api.onResearchStatus?.((_e, data) => {
+      if (data?.message) {
+        if (!open) expandToChat(mode || 'ask');
+        addMessage(data.message, 'system');
+        if (data.phase === 'searching' || data.phase === 'synthesizing') showThinking();
+      }
+    });
+    api.onStealthModeChanged?.((_e, data) => {
+      if (typeof data?.stealth === 'boolean') {
+        applyStealthUI(data.stealth, { persist: true, notifyMain: false });
+        measureAndResize();
+      }
+    });
+    api.onActivateOverlay?.(async () => {
+      // Clyra Cmd+/ / Voice Call / control API show path
+      await runBootAnimation();
+      window.electronAPI?.setChatDrawerOpen?.(false);
+    });
+    api.onDeactivateOverlay?.(() => {
+      shell.classList.remove('is-boot-reveal', 'is-boot-fade', 'is-boot-expand');
+      shell.classList.add('is-boot-squish');
+    });
+  }
+
+  // Fit collapsed pill on load + boot animation + stealth restore
+  loadHistory();
+  setControlButtonState(false);
+  try {
+    stealthOn = localStorage.getItem(STEALTH_KEY) === '1';
+  } catch (_) {
+    stealthOn = false;
+  }
+  applyStealthUI(stealthOn, { persist: false, notifyMain: true });
+  applyThemeFromSystem();
+  try {
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyThemeFromSystem);
+  } catch (_) {
+    /* ignore */
+  }
+
+  (async () => {
+    let defer = false;
+    try {
+      const flags = await window.electronAPI?.shouldDeferActivate?.();
+      defer = Boolean(flags?.defer);
+    } catch (_) {
+      defer = false;
+    }
+
+    if (defer) {
+      // Managed by Clyra: stay collapsed/invisible until Cmd+/ or Voice Call.
+      shell.classList.add('is-boot-squish');
+      if (window.electronAPI?.resizeWindow) {
+        await window.electronAPI.resizeWindow(56, COLLAPSED_H);
+      }
+      window.electronAPI?.notifyMainWindowReady?.();
+      return;
+    }
+
+    await runBootAnimation();
+    window.electronAPI?.setChatDrawerOpen?.(false);
+    window.electronAPI?.notifyMainWindowReady?.();
+    // Re-apply stealth to main once window is ready (content protection)
+    if (stealthOn) applyStealthUI(true, { persist: false, notifyMain: true });
+  })();
+
+  window.barChat = {
+    isOpen: () => open,
+    expandToChat,
+    collapse,
+    runAutoAnswer,
+    measureAndResize,
+    enterTaskPrompt,
+    stopControlFromBar,
+    setStealth: applyStealthUI,
+    isStealth: () => stealthOn,
+    runBootAnimation,
+  };
+})();

@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Visual Scan</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      pointer-events: none;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scan"></canvas>
+  <script>
+    const DURATION_MS = 1650;
+    const ICE = "rgba(224, 236, 248, ";
+    const WAVE = "rgba(242, 248, 255, ";
+
+    function easeOutCubic(t) {
+      return 1 - Math.pow(1 - t, 3);
+    }
+
+    function drawRoundedRect(ctx, x, y, w, h, r) {
+      const radius = Math.min(r, w / 2, h / 2);
+      ctx.beginPath();
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + w - radius, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+      ctx.lineTo(x + w, y + h - radius);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+      ctx.lineTo(x + radius, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+      ctx.closePath();
+    }
+
+    function startScan(scene) {
+      const canvas = document.getElementById("scan");
+      const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.round(scene.display.width));
+      const height = Math.max(1, Math.round(scene.display.height));
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const center = { x: width / 2, y: height / 2 };
+      const maxRadius = Math.hypot(width, height) * 0.55;
+      const contours = (scene.contours || []).map((r) => ({
+        x: r.x - scene.display.x,
+        y: r.y - scene.display.y,
+        width: r.width,
+        height: r.height,
+        dist: Math.hypot(r.x + r.width / 2 - scene.display.x - center.x, r.y + r.height / 2 - scene.display.y - center.y),
+      }));
+      const maxDist = Math.max(1, ...contours.map((c) => c.dist), 1);
+      const reduceMotion = Boolean(scene.reduceMotion);
+
+      const started = performance.now();
+      let raf = 0;
+
+      function frame(now) {
+        const elapsed = now - started;
+        const t = Math.min(1, elapsed / DURATION_MS);
+        ctx.clearRect(0, 0, width, height);
+
+        if (reduceMotion) {
+          const pulse = Math.sin((elapsed / DURATION_MS) * Math.PI) * 0.28;
+          ctx.fillStyle = WAVE + pulse + ")";
+          ctx.fillRect(0, 0, width, height);
+        } else {
+          const waveT = easeOutCubic(Math.min(1, t / 0.82));
+          const radius = maxRadius * waveT;
+          const waveAlpha = 0.42 * (1 - Math.max(0, (t - 0.45) / 0.55));
+          if (waveAlpha > 0.01) {
+            ctx.beginPath();
+            ctx.arc(center.x, center.y, Math.max(2, radius), 0, Math.PI * 2);
+            ctx.strokeStyle = WAVE + waveAlpha + ")";
+            ctx.lineWidth = 1.6;
+            ctx.stroke();
+          }
+
+          for (const rect of contours) {
+            const reveal = rect.dist / maxDist;
+            const localT = (t - reveal * 0.72) / 0.22;
+            if (localT <= 0) continue;
+            const alpha = Math.max(0, Math.min(0.72, localT) * (1 - Math.max(0, (t - 0.78) / 0.22)));
+            if (alpha <= 0.01) continue;
+            ctx.strokeStyle = ICE + alpha + ")";
+            ctx.lineWidth = 1.1;
+            drawRoundedRect(ctx, rect.x, rect.y, rect.width, rect.height, 3);
+            ctx.stroke();
+          }
+        }
+
+        if (t < 1) {
+          raf = requestAnimationFrame(frame);
+        } else {
+          ctx.clearRect(0, 0, width, height);
+          window.__scanDone = true;
+        }
+      }
+
+      raf = requestAnimationFrame(frame);
+      return () => cancelAnimationFrame(raf);
+    }
+
+    const params = new URLSearchParams(location.search);
+    const encoded = params.get("scene");
+    if (encoded) {
+      try {
+        startScan(JSON.parse(decodeURIComponent(encoded)));
+      } catch (error) {
+        console.error("visual-scan scene parse failed", error);
+        window.__scanDone = true;
+      }
+    } else {
+      window.__scanDone = true;
+    }
+  </script>
+</body>
+</html>

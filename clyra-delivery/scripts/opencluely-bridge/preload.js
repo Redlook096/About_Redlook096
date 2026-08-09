@@ -1,0 +1,201 @@
+const { contextBridge, ipcRenderer } = require('electron')
+
+// Expose protected methods that allow the renderer process to use
+// the ipcRenderer without exposing the entire object
+contextBridge.exposeInMainWorld('electronAPI', {
+  // Screenshot and OCR
+  takeScreenshot: () => ipcRenderer.invoke('take-screenshot'),
+  
+  // Speech recognition
+  startSpeechRecognition: () => ipcRenderer.invoke('start-speech-recognition'),
+  stopSpeechRecognition: () => ipcRenderer.invoke('stop-speech-recognition'),
+  sendAudioChunk: (buffer) => ipcRenderer.send('audio-chunk', { buffer }),
+  getSpeechAvailability: () => ipcRenderer.invoke('get-speech-availability'),
+  
+  // Window management
+  showAllWindows: (opts = {}) => ipcRenderer.invoke('show-all-windows', opts || {}),
+  hideAllWindows: () => ipcRenderer.invoke('hide-all-windows'),
+  enableWindowInteraction: () => ipcRenderer.invoke('enable-window-interaction'),
+  disableWindowInteraction: () => ipcRenderer.invoke('disable-window-interaction'),
+  switchToChat: () => ipcRenderer.invoke('switch-to-chat'),
+  switchToSkills: () => ipcRenderer.invoke('switch-to-skills'),
+  resizeWindow: (width, height, opts = {}) =>
+    ipcRenderer.invoke('resize-window', {
+      width,
+      height,
+      recenter: opts?.recenter,
+    }),
+  setChatDrawerOpen: (open, opts = {}) =>
+    ipcRenderer.invoke('set-chat-drawer-open', {
+      open: Boolean(typeof open === 'object' ? open?.open : open),
+      recenter: typeof open === 'object' ? open?.recenter : opts?.recenter,
+    }),
+  onToggleChatDrawer: (callback) => ipcRenderer.on('toggle-chat-drawer', callback),
+  shouldDeferActivate: () => ipcRenderer.invoke('should-defer-activate'),
+  ensureCameraAccess: () => ipcRenderer.invoke('ensure-camera-access'),
+  ensureMicrophoneAccess: () => ipcRenderer.invoke('ensure-microphone-access'),
+  onActivateOverlay: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('activate-overlay', listener);
+    return () => ipcRenderer.removeListener('activate-overlay', listener);
+  },
+  onDeactivateOverlay: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('deactivate-overlay', listener);
+    return () => ipcRenderer.removeListener('deactivate-overlay', listener);
+  },
+  moveWindow: (deltaX, deltaY) => ipcRenderer.invoke('move-window', { deltaX, deltaY }),
+  getWindowStats: () => ipcRenderer.invoke('get-window-stats'),
+  
+  // Session memory
+  getSessionHistory: () => ipcRenderer.invoke('get-session-history'),
+  getLLMSessionHistory: () => ipcRenderer.invoke('get-llm-session-history'),
+  clearSessionMemory: () => ipcRenderer.invoke('clear-session-memory'),
+  formatSessionHistory: () => ipcRenderer.invoke('format-session-history'),
+  sendChatMessage: (text) => ipcRenderer.invoke('send-chat-message', text),
+  getSkillPrompt: (skillName) => ipcRenderer.invoke('get-skill-prompt', skillName),
+  startDesktopControl: (task) => ipcRenderer.invoke('start-desktop-control', { task }),
+  stopDesktopControl: () => ipcRenderer.invoke('stop-desktop-control'),
+  getDesktopControlStatus: () => ipcRenderer.invoke('get-desktop-control-status'),
+  onControlStatus: (callback) => ipcRenderer.on('control-status', callback),
+  onResearchStatus: (callback) => ipcRenderer.on('research-status', callback),
+  onStealthModeChanged: (callback) => ipcRenderer.on('stealth-mode-changed', callback),
+  
+  // Gemini LLM configuration
+  setGeminiApiKey: (apiKey) => ipcRenderer.invoke('set-gemini-api-key', apiKey),
+  getGeminiStatus: () => ipcRenderer.invoke('get-gemini-status'),
+  testGeminiConnection: () => ipcRenderer.invoke('test-gemini-connection'),
+  
+  // Settings
+  showSettings: () => ipcRenderer.invoke('show-settings'),
+  hideSettings: () => ipcRenderer.invoke('hide-settings'),
+  getSettings: () => ipcRenderer.invoke('get-settings'),
+  saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
+
+  // First-run onboarding
+  getFirstRunStatus: () => ipcRenderer.invoke('get-first-run-status'),
+  completeFirstRun: () => ipcRenderer.invoke('complete-first-run'),
+  openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  closeOnboarding: () => ipcRenderer.invoke('close-onboarding'),
+  detectWhisper: () => ipcRenderer.invoke('detect-whisper'),
+  installWhisper: () => ipcRenderer.invoke('install-whisper'),
+  downloadWhisperModel: (modelName) => ipcRenderer.invoke('download-whisper-model', modelName),
+  onInstallProgress: (callback) => {
+    const wrapped = (_event, line) => {
+      try { callback(line); } catch (e) { console.error('onInstallProgress error:', e); }
+    };
+    ipcRenderer.on('install-progress', wrapped);
+    return () => ipcRenderer.removeListener('install-progress', wrapped);
+  },
+  updateAppIcon: (iconKey) => ipcRenderer.invoke('update-app-icon', iconKey),
+  updateActiveSkill: (skill) => ipcRenderer.invoke('update-active-skill', skill),
+  setStealthMode: (enabled) => ipcRenderer.invoke('set-stealth-mode', { enabled: Boolean(enabled) }),
+  getStealthMode: () => ipcRenderer.invoke('get-stealth-mode'),
+  restartAppForStealth: () => ipcRenderer.invoke('restart-app-for-stealth'),
+  closeWindow: () => ipcRenderer.invoke('close-window'),
+  notifyMainWindowReady: () => {
+    try {
+      ipcRenderer.send('main-window-ready');
+    } catch (error) {
+      console.error('Error notifying main window ready:', error);
+    }
+  },
+  quit: () => {
+    try {
+      ipcRenderer.send('quit-app');
+    } catch (error) {
+      console.error('Error in quit:', error);
+    }
+  },
+  
+  // LLM window specific methods
+  expandLlmWindow: (contentMetrics) => ipcRenderer.invoke('expand-llm-window', contentMetrics),
+  resizeLlmWindowForContent: (contentMetrics) => ipcRenderer.invoke('resize-llm-window-for-content', contentMetrics),
+
+  // Clipboard helper for reliable copy actions
+  copyToClipboard: (text) => {
+    try {
+      return ipcRenderer.invoke('copy-to-clipboard', String(text ?? ''));
+    } catch (e) {
+      console.error('copyToClipboard failed:', e);
+      return false;
+    }
+  },
+  
+  // Display management
+  listDisplays: () => ipcRenderer.invoke('list-displays'),
+  captureArea: (options) => ipcRenderer.invoke('capture-area', options),
+
+  // Visual Intelligence Scan
+  visualScan: {
+    start: (payload) => ipcRenderer.invoke('visual-scan:start', payload || {}),
+    stop: () => ipcRenderer.invoke('visual-scan:stop'),
+    isAvailable: () => ipcRenderer.invoke('visual-scan:is-available'),
+    permissionState: () => ipcRenderer.invoke('visual-scan:permission-state'),
+    setQuality: (quality) => ipcRenderer.invoke('visual-scan:set-quality', { quality }),
+  },
+  
+  // Event listeners
+  onTranscriptionReceived: (callback) => ipcRenderer.on('transcription-received', callback),
+  onInterimTranscription: (callback) => ipcRenderer.on('interim-transcription', callback),
+  onSpeechStatus: (callback) => ipcRenderer.on('speech-status', callback),
+  onSpeechError: (callback) => ipcRenderer.on('speech-error', callback),
+  onSpeechAvailability: (callback) => ipcRenderer.on('speech-availability', callback),
+  onSessionEvent: (callback) => ipcRenderer.on('session-event', callback),
+  onSessionCleared: (callback) => ipcRenderer.on('session-cleared', callback),
+  onOcrCompleted: (callback) => ipcRenderer.on('ocr-completed', callback),
+  onOcrError: (callback) => ipcRenderer.on('ocr-error', callback),
+  onLlmResponse: (callback) => ipcRenderer.on('llm-response', callback),
+  onLlmError: (callback) => ipcRenderer.on('llm-error', callback),
+  onTranscriptionLlmResponse: (callback) => ipcRenderer.on('transcription-llm-response', callback),
+  onTranscriptionLlmResponseStart: (callback) => ipcRenderer.on('transcription-llm-response-start', callback),
+  onTranscriptionLlmResponseChunk: (callback) => ipcRenderer.on('transcription-llm-response-chunk', callback),
+  onOpenGeminiConfig: (callback) => ipcRenderer.on('open-gemini-config', callback),
+  onDisplayLlmResponse: (callback) => ipcRenderer.on('display-llm-response', callback),
+  onShowLoading: (callback) => ipcRenderer.on('show-loading', callback),
+  onSkillChanged: (callback) => ipcRenderer.on('skill-changed', callback),
+  onInteractionModeChanged: (callback) => ipcRenderer.on('interaction-mode-changed', callback),
+  onRecordingStarted: (callback) => ipcRenderer.on('recording-started', callback),
+  onRecordingStopped: (callback) => ipcRenderer.on('recording-stopped', callback),
+  onCodingLanguageChanged: (callback) => ipcRenderer.on('coding-language-changed', callback),
+  onMainWindowShown: (callback) => ipcRenderer.on('main-window-shown', callback),
+  
+  // Generic receive method
+  receive: (channel, callback) => ipcRenderer.on(channel, callback),
+  
+  // Remove listeners
+  removeAllListeners: (channel) => ipcRenderer.removeAllListeners(channel)
+})
+
+contextBridge.exposeInMainWorld('api', {
+    send: (channel, data) => {
+        let validChannels = [
+            'close-settings',
+            'quit-app',
+            'save-settings',
+            'toggle-recording',
+            'toggle-interaction-mode',
+            'update-skill',
+            'window-loaded'
+        ];
+        if (validChannels.includes(channel)) {
+            ipcRenderer.send(channel, data);
+        } else {
+            console.warn('Invalid IPC channel:', channel);
+        }
+    },
+    receive: (channel, func) => {
+        let validChannels = [
+            'load-settings',
+            'recording-state-changed',
+            'interaction-mode-changed',
+            'skill-updated',
+            'update-skill',
+            'recording-started',
+            'recording-stopped'
+        ];
+        if (validChannels.includes(channel)) {
+            ipcRenderer.on(channel, (event, ...args) => func(...args));
+        }
+    }
+});
