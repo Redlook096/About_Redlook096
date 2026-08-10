@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Visual Scan</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent !important;
+      pointer-events: none;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: transparent !important;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scan"></canvas>
+  <script>
+    /**
+     * Butter-smooth Visual Intelligence Scan (Electron path).
+     * Single rAF clock, precomputed Path2D, no shadowBlur, ≤3 wave strokes/frame.
+     * Icy white/blue — Apple-like structure reveal, not radar/HUD/neon.
+     */
+    const DURATION_MS = 1600;
+    const CENTER_MS = 110;
+    const FADE_TAIL = 0.2;
+
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    // Smooth quintic ease-out — less "robotic" than cubic.
+    const easeOut = (t) => {
+      const u = 1 - t;
+      return 1 - u * u * u * u * u;
+    };
+    const easeInOut = (t) =>
+      t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+    function roundedPath(x, y, w, h, r) {
+      const radius = Math.min(r, w * 0.5, h * 0.5);
+      const p = new Path2D();
+      p.moveTo(x + radius, y);
+      p.arcTo(x + w, y, x + w, y + h, radius);
+      p.arcTo(x + w, y + h, x, y + h, radius);
+      p.arcTo(x, y + h, x, y, radius);
+      p.arcTo(x, y, x + w, y, radius);
+      p.closePath();
+      return p;
+    }
+
+    function minDistToRect(ox, oy, r) {
+      const cx = clamp(ox, r.x, r.x + r.width);
+      const cy = clamp(oy, r.y, r.y + r.height);
+      return Math.hypot(cx - ox, cy - oy);
+    }
+
+    function startScan(scene) {
+      const canvas = document.getElementById("scan");
+      const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const width = Math.max(1, Math.round(scene.display.width));
+      const height = Math.max(1, Math.round(scene.display.height));
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.imageSmoothingEnabled = true;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+
+      const ox = width * 0.5;
+      const oy = height * 0.5;
+      const maxRadius = Math.hypot(Math.max(ox, width - ox), Math.max(oy, height - oy)) + 8;
+      const reduceMotion = Boolean(scene.reduceMotion);
+
+      const contours = (scene.contours || [])
+        .slice(0, 88)
+        .map((raw, index) => {
+          const x = raw.x - scene.display.x;
+          const y = raw.y - scene.display.y;
+          const w = raw.width;
+          const h = raw.height;
+          const area = w * h;
+          const importance =
+            raw.importance != null
+              ? raw.importance
+              : area > width * height * 0.18
+                ? 1
+                : area > width * height * 0.05
+                  ? 0.65
+                  : 0.35;
+          const radius =
+            importance >= 1 ? Math.min(12, Math.min(w, h) * 0.08)
+            : importance >= 0.6 ? Math.min(9, Math.min(w, h) * 0.12)
+            : Math.min(6, Math.min(w, h) * 0.16);
+          const activation = minDistToRect(ox, oy, { x, y, width: w, height: h });
+          const peri = 2 * (w + h);
+          const depth = Number(raw.hierarchyDepth) || (index % 3);
+          return {
+            path: roundedPath(x, y, w, h, radius),
+            activation,
+            peri,
+            importance,
+            depth,
+            peak: importance >= 1 ? 0.5 : importance >= 0.6 ? 0.34 : 0.2,
+            traceDur: clamp(peri / 5600, 0.09, 0.22),
+            lineWidth: importance >= 1 ? 1.2 : importance >= 0.6 ? 1.05 : 0.9,
+          };
+        })
+        .sort((a, b) => a.activation - b.activation);
+
+      const started = performance.now();
+      let raf = 0;
+
+      function frame(now) {
+        const elapsed = now - started;
+        const t = clamp(elapsed / DURATION_MS, 0, 1);
+        ctx.clearRect(0, 0, width, height);
+
+        if (elapsed < CENTER_MS + 80) {
+          const p = clamp(elapsed / CENTER_MS, 0, 1);
+          const fade = elapsed > CENTER_MS ? 1 - (elapsed - CENTER_MS) / 80 : 1;
+          const r = 1.2 + easeOut(p) * 14;
+          const g = ctx.createRadialGradient(ox, oy, 0, ox, oy, r);
+          g.addColorStop(0, `rgba(255,255,255,${0.55 * fade})`);
+          g.addColorStop(0.5, `rgba(230,240,255,${0.16 * fade})`);
+          g.addColorStop(1, "rgba(200,220,255,0)");
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.arc(ox, oy, r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        if (reduceMotion) {
+          for (const c of contours) {
+            const local = clamp((t - c.activation / maxRadius) / 0.28, 0, 1);
+            if (local <= 0) continue;
+            ctx.globalAlpha = 0.16 * easeInOut(local) * (1 - t * 0.5);
+            ctx.strokeStyle = "rgb(230,240,255)";
+            ctx.lineWidth = c.lineWidth;
+            ctx.stroke(c.path);
+          }
+          ctx.globalAlpha = 1;
+        } else {
+          const scanT = easeOut(clamp((elapsed - 80) / (DURATION_MS - 140), 0, 1));
+          const radius = maxRadius * scanT;
+          const waveFade = 1 - clamp((t - (1 - FADE_TAIL)) / FADE_TAIL, 0, 1);
+
+          if (elapsed > 70 && waveFade > 0.02) {
+            ctx.globalAlpha = 0.48 * waveFade;
+            ctx.strokeStyle = "rgb(255,255,255)";
+            ctx.lineWidth = 1.1;
+            ctx.beginPath();
+            ctx.arc(ox, oy, Math.max(0.5, radius), 0, Math.PI * 2);
+            ctx.stroke();
+
+            ctx.globalAlpha = 0.12 * waveFade;
+            ctx.strokeStyle = "rgb(210,228,255)";
+            ctx.lineWidth = 2.8;
+            ctx.beginPath();
+            ctx.arc(ox, oy, Math.max(0.5, radius), 0, Math.PI * 2);
+            ctx.stroke();
+
+            const micro = radius - maxRadius * (48 / DURATION_MS);
+            if (micro > 12) {
+              ctx.globalAlpha = 0.09 * waveFade;
+              ctx.strokeStyle = "rgb(225,238,255)";
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.arc(ox, oy, micro, 0, Math.PI * 2);
+              ctx.stroke();
+            }
+            ctx.globalAlpha = 1;
+          }
+
+          for (const c of contours) {
+            const activateAt = c.activation / maxRadius + c.depth * 0.004;
+            const delta = t - activateAt;
+            if (delta < 0) continue;
+            const draw = clamp(delta / c.traceDur, 0, 1);
+            const fadeStart = activateAt + c.traceDur + 0.02;
+            const fade = t < fadeStart ? 1 : 1 - clamp((t - fadeStart) / FADE_TAIL, 0, 1);
+            if (fade <= 0.01) continue;
+
+            const waveGap = Math.abs(radius - c.activation);
+            const boost = Math.exp(-(waveGap * waveGap) / 1600);
+            const alpha = (c.peak * 0.5 + c.peak * 0.5 * boost) * fade * easeOut(draw);
+            if (alpha < 0.018) continue;
+
+            const len = Math.max(40, c.peri);
+            ctx.globalAlpha = alpha;
+            ctx.strokeStyle = "rgb(238,245,255)";
+            ctx.lineWidth = c.lineWidth;
+            ctx.setLineDash([len * draw, len]);
+            ctx.lineDashOffset = 0;
+            ctx.stroke(c.path);
+          }
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
+        }
+
+        if (t < 1) {
+          raf = requestAnimationFrame(frame);
+        } else {
+          ctx.clearRect(0, 0, width, height);
+          window.__scanDone = true;
+        }
+      }
+
+      raf = requestAnimationFrame(frame);
+      return () => cancelAnimationFrame(raf);
+    }
+
+    const params = new URLSearchParams(location.search);
+    const encoded = params.get("scene");
+    if (encoded) {
+      try {
+        startScan(JSON.parse(decodeURIComponent(encoded)));
+      } catch (error) {
+        console.error("visual-scan scene parse failed", error);
+        window.__scanDone = true;
+      }
+    } else {
+      window.__scanDone = true;
+    }
+  </script>
+</body>
+</html>
