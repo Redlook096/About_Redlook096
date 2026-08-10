@@ -1,27 +1,28 @@
-# Clyra OpenCluely bar + Visual Intelligence Scan delivery
+# Clyra delivery — OpenCluely bar + Visual Intelligence Scan
 
-This branch was produced because the cloud agent was started against `About_Redlook096` instead of `Clyra-AI-Final`.
+Mirrored fixes for [Clyra-AI-Final](https://github.com/Redlook096/Clyra-AI-Final) (write access unavailable to the cloud agent).
+
+## Critical screenshot / scan fixes in this package
+
+1. **Capture before scan** — the AI screenshots the real desktop first; the Visual Intelligence Scan starts only after pixels are safe.
+2. **Never hide apps** — macOS no longer calls `win.hide()` during capture (that caused Spaces flicker / “all apps disappeared”). Overlays use `setContentProtection(true)` instead.
+3. **Transparent front-layer overlay** — fullscreen scan uses `#00000000` background, macOS `panel` type, `showInactive`, `screen-saver` always-on-top, and content protection so screencapture omits it.
+4. **Smoother / lighter animation** — single rAF clock, precomputed Path2D, no `shadowBlur`, quintic ease-out, nested UI contours; multi-display support.
+5. **Linux transparency** — removed `disable-gpu-compositing` (it forced an opaque black overlay) and enabled `enable-transparent-visuals`.
 
 ## Apply to Clyra-AI-Final
 
 ```bash
-git clone https://github.com/Redlook096/Clyra-AI-Final.git
-cd Clyra-AI-Final
-git checkout -b cursor/opencluely-bar-scan-b2ee
-git am /path/to/clyra-delivery/opencluely-bar-scan.patch
+cd /path/to/Clyra-AI-Final
+git apply --3way path/to/clyra-delivery/opencluely-bar-scan.patch
 # or copy files from clyra-delivery/ over the matching paths
-npm run opencluely:clone
-npm run desktop:dev
-# Activate with Cmd+/ then Ask / Auto Answer / "what's on my screen"
+npm run opencluely:clone   # refreshes apps/opencluely from scripts/opencluely-bridge
 ```
 
-## What changed
-
-1. **OpenCluely bar** — expand only downward; Ask fades open immediately; chat-parity assistant print + user bubbles; light/dark theme; thinking border glow; button icon hover motion; composer scaled like chat (no command palette).
-2. **Web search** — no longer triggers on casual/screen questions; explicit research verbs only.
-3. **What's on my screen** — screen path + Visual Intelligence Scan animation (native Swift on macOS, Electron canvas fallback elsewhere).
-4. **Visual Intelligence Scan** — AX/ScreenCaptureKit native package + Electron manager overlay.
-
-Source commits (from local Clyra clone):
-- `471a2c5` Add Visual Intelligence Scan system
-- `471cf2b` Polish OpenCluely bar
+Key paths:
+- `electron/visual-scan-manager.mjs`
+- `electron/visual-scan-overlay.html`
+- `scripts/opencluely-bridge/main.js`
+- `scripts/opencluely-bridge/capture.service.js`
+- `scripts/opencluely-bridge/ui/bar-chat.js`
+- `scripts/opencluely-bridge/visual-scan-bridge.js`

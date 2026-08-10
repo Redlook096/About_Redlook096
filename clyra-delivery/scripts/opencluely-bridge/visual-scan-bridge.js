@@ -46,8 +46,12 @@ module.exports = {
     return manager.permissionState();
   },
   async stop() {
-    const manager = await loadManager();
-    return manager.stop();
+    try {
+      const manager = await loadManager();
+      return manager.stop();
+    } catch (_) {
+      return { ok: true };
+    }
   },
   async setQuality(quality) {
     const manager = await loadManager();

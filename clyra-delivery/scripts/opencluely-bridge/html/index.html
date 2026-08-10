@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <title>OpenCluely</title>
     <link href="./dist/output.css" rel="stylesheet" />
-    <link href="./src/styles/common.css" rel="stylesheet" />
+    <!-- common.css intentionally omitted: donor chat styles fight the light Clyra bar -->
     <style>
       :root {
         --oc-glass: rgba(248, 249, 251, 0.88);
@@ -132,46 +132,30 @@
         from { opacity: 0.72; }
         to { opacity: 1; }
       }
-      /* Subtle blue glow line traveling the full border while AI thinks */
-      .oc-shell.is-thinking::before {
-        content: "";
+      /* Thinking border glow — SVG stroke travels full perimeter (reliable in Electron) */
+      .oc-think-glow {
         position: absolute;
         inset: 0;
-        border-radius: inherit;
-        padding: 1.5px;
-        background: conic-gradient(from var(--oc-glow-angle, 0deg), transparent 0%, transparent 62%, rgba(59,130,246,0.05) 72%, var(--oc-glow) 86%, rgba(225,238,255,0.85) 92%, transparent 100%);
-        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-        -webkit-mask-composite: xor;
-        mask-composite: exclude;
+        width: 100%;
+        height: 100%;
         pointer-events: none;
-        z-index: 8;
-        animation: oc-glow-spin 1.8s linear infinite;
-        opacity: 0.9;
+        z-index: 9;
+        opacity: 0;
+        transition: opacity 180ms ease;
+        overflow: visible;
       }
-      @property --oc-glow-angle {
-        syntax: "<angle>";
-        inherits: false;
-        initial-value: 0deg;
+      .oc-shell.is-thinking .oc-think-glow { opacity: 1; }
+      .oc-think-glow rect {
+        fill: none;
+        stroke: url(#ocGlowGrad);
+        stroke-width: 1.75;
+        stroke-linecap: round;
+        stroke-dasharray: 72 520;
+        animation: oc-glow-dash 1.65s linear infinite;
+        filter: drop-shadow(0 0 3px rgba(59,130,246,0.35));
       }
-      @keyframes oc-glow-spin {
-        to { --oc-glow-angle: 360deg; }
-      }
-      @supports not (background: conic-gradient(from var(--oc-glow-angle), #000, #fff)) {
-        .oc-shell.is-thinking::before {
-          background: linear-gradient(90deg, transparent, rgba(59,130,246,0.35), rgba(225,238,255,0.7), rgba(59,130,246,0.35), transparent);
-          background-size: 200% 100%;
-          animation: oc-glow-slide 1.6s linear infinite;
-          -webkit-mask: none;
-          mask: none;
-          border-radius: inherit;
-          padding: 0;
-          border: 1.5px solid transparent;
-          opacity: 0.55;
-        }
-        @keyframes oc-glow-slide {
-          0% { background-position: 100% 0; }
-          100% { background-position: -100% 0; }
-        }
+      @keyframes oc-glow-dash {
+        to { stroke-dashoffset: -592; }
       }
 
       .oc-shell.is-boot-squish {
@@ -328,8 +312,9 @@
       .oc-shell.is-wide .command-tab,
       .oc-shell.is-chat-open .command-tab {
         /* Keep left/right chrome optically balanced when expanded */
-        padding-inline: 10px;
+        padding-inline: 12px;
       }
+      .command-tab { padding-right: 10px !important; }
       .oc-shell.is-chat-open .oc-drag,
       .oc-shell.is-wide .oc-drag {
         margin-left: 0;
@@ -840,10 +825,53 @@
       .oc-shell.is-animating {
         will-change: width, transform, opacity, height;
       }
+
+      /* Final chat-parity overrides (beat any residual donor styles) */
+      .chat-messages .message,
+      .chat-messages .message.assistant,
+      .chat-messages .message.system,
+      .chat-messages .message.thinking {
+        background: transparent !important;
+        border: none !important;
+        border-left: none !important;
+        box-shadow: none !important;
+        backdrop-filter: none !important;
+        padding: 2px 2px 0 !important;
+        margin: 0 !important;
+        border-radius: 0 !important;
+      }
+      .chat-messages .message.assistant .message-text,
+      .chat-messages .message.system .message-text,
+      .chat-messages .message.thinking .message-text,
+      .chat-messages .thinking-row {
+        color: var(--oc-assistant-fg) !important;
+        text-shadow: none !important;
+        background: transparent !important;
+      }
+      .chat-messages .message.assistant .message-text strong {
+        color: var(--oc-text-strong) !important;
+        font-weight: 650;
+      }
+      .chat-messages .message.user {
+        background: transparent !important;
+        border: none !important;
+        padding: 0 !important;
+      }
     </style>
   </head>
   <body data-oc-light-bar="1">
     <div class="oc-shell is-boot-squish" id="ocShell">
+      <svg class="oc-think-glow" aria-hidden="true" preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="ocGlowGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="rgba(225,238,255,0)"/>
+            <stop offset="45%" stop-color="rgba(195,220,255,0.55)"/>
+            <stop offset="70%" stop-color="rgba(59,130,246,0.95)"/>
+            <stop offset="100%" stop-color="rgba(225,238,255,0)"/>
+          </linearGradient>
+        </defs>
+        <rect x="1" y="1" width="100%" height="100%" rx="22" ry="22" pathLength="592" vector-effect="non-scaling-stroke"/>
+      </svg>
       <div class="command-tab" id="commandTab">
         <button type="button" class="oc-close oc-boot-hide" id="ocCloseBtn" title="Close" aria-label="Close">
           <svg class="oc-icon-x" viewBox="0 0 12 12" fill="none" aria-hidden="true">

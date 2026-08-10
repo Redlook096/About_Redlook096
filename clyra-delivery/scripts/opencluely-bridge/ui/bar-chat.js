@@ -131,7 +131,27 @@
 
   function setThinkingChrome(on) {
     shell.classList.toggle('is-thinking', Boolean(on));
+    if (on) syncThinkGlowGeometry();
   }
+
+  function syncThinkGlowGeometry() {
+    try {
+      const svg = shell.querySelector('.oc-think-glow');
+      const rect = svg?.querySelector('rect');
+      if (!svg || !rect) return;
+      const r = shell.getBoundingClientRect();
+      const radius = open || wide ? 22 : 999;
+      svg.setAttribute('viewBox', `0 0 ${Math.max(1, r.width)} ${Math.max(1, r.height)}`);
+      rect.setAttribute('width', String(Math.max(1, r.width - 2)));
+      rect.setAttribute('height', String(Math.max(1, r.height - 2)));
+      rect.setAttribute('rx', String(open || wide ? 22 : Math.min(26, r.height / 2)));
+      rect.setAttribute('ry', String(open || wide ? 22 : Math.min(26, r.height / 2)));
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+
 
   function showThinking() {
     hideThinking();
@@ -299,6 +319,7 @@
       animating = false;
     }
 
+    syncThinkGlowGeometry();
     if (nextMode === 'ask') {
       // Focus immediately — no artificial delay.
       inputEl?.focus();
@@ -621,8 +642,8 @@
     autoGrow();
     showThinking();
     try {
-      const screenAsk = /\b(what('?s| is) on (my )?screen|on my screen|look at (my )?screen|what do you see|describe (the |my )?(screen|desktop)|screenshot)\b/i.test(text);
-      if (screenAsk) void window.electronAPI?.visualScan?.start?.();
+      // Do NOT start the visual scan here. Main captures the real desktop first,
+      // then fires the scan. Starting early covers the screen and yields black frames.
       await window.electronAPI?.sendChatMessage?.(text);
     } catch (error) {
       hideThinking();
@@ -636,9 +657,7 @@
     addMessage('Auto Answer — reading your screen…', 'system');
     showThinking();
     try {
-      // Premium Visual Intelligence scan (fire-and-forget; main also triggers).
-      void window.electronAPI?.visualScan?.start?.();
-      // Prefer dedicated control endpoint when available
+      // Scan is started by main AFTER a real desktop capture (not here).
       const res = await fetch('http://127.0.0.1:3847/auto-answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

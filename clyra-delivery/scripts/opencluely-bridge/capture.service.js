@@ -39,7 +39,18 @@ class CaptureService {
     this.isProcessing = true;
     const startTime = Date.now();
     try {
-      const { image, metadata } = await this.captureScreenshot(options);
+      let image;
+      let metadata;
+      try {
+        ({ image, metadata } = await this.captureScreenshot(options));
+      } catch (primaryError) {
+        // If native capture looked black (overlay race) or failed, fall back once.
+        logger.warn('Primary capture failed; retrying via desktopCapturer', {
+          error: primaryError.message
+        });
+        const targetDisplay = this._getTargetDisplay(options.displayId);
+        ({ image, metadata } = await this._captureWithDesktopCapturer(targetDisplay, options));
+      }
 
       let finalImage = image;
       if (options.area && this._isValidArea(options.area)) {
@@ -48,6 +59,11 @@ class CaptureService {
         } catch (e) {
           logger.warn('Crop failed, returning full image', { error: e.message, area: options.area });
         }
+      }
+
+      // Final guard: refuse empty/black frames so the LLM never "sees" a blank overlay.
+      if (this._looksMostlyBlack(finalImage)) {
+        throw new Error('Captured frame looked empty/black — real desktop was not visible');
       }
 
       const buffer = finalImage.toPNG();
@@ -182,19 +198,57 @@ class CaptureService {
 
   _captureMacNative(targetDisplay) {
     const outPath = path.join(os.tmpdir(), `oc-screencapture-${process.pid}-${Date.now()}.png`);
-    execFileSync('screencapture', ['-x', outPath], { timeout: 20000 });
+    // Capture the interactive display only. Never use UI that hides other apps.
+    // -x: no shutter sound. -D: display number (1-based for screencapture).
+    const displays = screen.getAllDisplays();
+    const index = Math.max(0, displays.findIndex((d) => d.id === targetDisplay.id));
+    const displayNumber = String(index + 1);
+    try {
+      execFileSync('screencapture', ['-x', '-D', displayNumber, outPath], { timeout: 20000 });
+    } catch (error) {
+      // Fallback without -D for older macOS.
+      execFileSync('screencapture', ['-x', outPath], { timeout: 20000 });
+    }
     const image = this._loadPng(outPath);
-    logger.info('Using macOS screencapture', { imageSize: image.getSize() });
+    const size = image.getSize();
+    if (size.width < 32 || size.height < 32) {
+      throw new Error('macOS screencapture returned an empty/too-small image');
+    }
+    // Reject near-black frames (usually means we photographed a black overlay).
+    if (this._looksMostlyBlack(image)) {
+      throw new Error('macOS screencapture looked empty/black — overlay may have been included');
+    }
+    logger.info('Using macOS screencapture', { imageSize: size, displayNumber });
     return {
       image,
       metadata: {
         displayId: targetDisplay.id,
         sourceName: 'screencapture',
         method: 'macos-screencapture',
-        dimensions: image.getSize(),
+        dimensions: size,
         captureTime: new Date().toISOString()
       }
     };
+  }
+
+  _looksMostlyBlack(image) {
+    try {
+      const sample = image.resize({ width: 32, height: 18 });
+      const { width, height } = sample.getSize();
+      const buf = sample.toBitmap();
+      // Electron bitmap is BGRA on most platforms.
+      let dark = 0;
+      const pixels = width * height;
+      for (let i = 0; i < buf.length; i += 4) {
+        const b = buf[i];
+        const g = buf[i + 1];
+        const r = buf[i + 2];
+        if (r + g + b < 36) dark += 1;
+      }
+      return dark / Math.max(1, pixels) > 0.92;
+    } catch (_) {
+      return false;
+    }
   }
 
   _captureWindowsNative(targetDisplay) {

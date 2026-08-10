@@ -1,7 +1,7 @@
 From 471a2c5a379eee3ab2cb560f75dc2a150d79fbd4 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sun, 9 Aug 2026 05:17:13 +0000
-Subject: [PATCH 1/2] Add Visual Intelligence Scan system for Clyra and
+Subject: [PATCH 1/3] Add Visual Intelligence Scan system for Clyra and
  OpenCluely
 
 - Native macOS Swift overlay (AXUIElement + ScreenCaptureKit + Core Animation)
@@ -1461,7 +1461,7 @@ index 0000000..f17def4
 From 471cf2bf3dcfc938362779a903936c2828948980 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sun, 9 Aug 2026 05:20:32 +0000
-Subject: [PATCH 2/2] Polish OpenCluely bar: expand-down Ask, chat-parity UI,
+Subject: [PATCH 2/3] Polish OpenCluely bar: expand-down Ask, chat-parity UI,
  smarter search
 
 Pin the overlay top edge so expansion only grows downward, make Ask fade
@@ -2463,6 +2463,1339 @@ index a4af56b..8aba93f 100644
    );
  }
  
+-- 
+2.43.0
+
+
+From 9892d948b44cca090db1599a660a9a99119cb49e Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 10 Aug 2026 02:04:06 +0000
+Subject: [PATCH 3/3] Fix Visual Scan: capture desktop first, transparent front
+ overlay
+
+Stop hiding apps during screenshots (macOS Space flicker), capture the
+real desktop before the scan overlay starts, and keep the overlay
+content-protected so vision never photographs a black fullscreen layer.
+Also smooth the scan animation and preserve window transparency on Linux.
+---
+ electron/visual-scan-manager.mjs              | 394 +++++++++++-------
+ electron/visual-scan-overlay.html             | 201 ++++++---
+ .../Sources/VisualScan/OverlayPanel.swift     |   4 +
+ scripts/opencluely-bridge/capture.service.js  |  62 ++-
+ scripts/opencluely-bridge/html/index.html     | 106 +++--
+ scripts/opencluely-bridge/main.js             | 109 ++---
+ scripts/opencluely-bridge/ui/bar-chat.js      |  29 +-
+ .../opencluely-bridge/visual-scan-bridge.js   |   8 +-
+ 8 files changed, 618 insertions(+), 295 deletions(-)
+
+diff --git a/electron/visual-scan-manager.mjs b/electron/visual-scan-manager.mjs
+index be5b190..754d942 100644
+--- a/electron/visual-scan-manager.mjs
++++ b/electron/visual-scan-manager.mjs
+@@ -1,9 +1,15 @@
+ /**
+  * Visual Intelligence Scan — Electron main-process bridge.
+- * macOS: spawns native visual-scan binary when available.
+- * Other platforms / missing binary: transparent canvas overlay via desktopCapturer geometry.
++ *
++ * Design goals:
++ *  - Front-most transparent overlay on EVERY display
++ *  - Never opaque / never hides other apps (macOS "apps vanished" bug)
++ *  - Content-protected so screencapture / desktopCapturer omit it
++ *  - Lightweight: synthetic UI contours first paint; no desktopCapturer during start
++ *    (desktopCapturer on macOS can hitch Screen Recording and blank frames)
++ *  - Optional native macOS binary when present
+  */
+-import { BrowserWindow, desktopCapturer, screen, systemPreferences } from "electron";
++import { BrowserWindow, screen, systemPreferences } from "electron";
+ import { execFile, spawn } from "node:child_process";
+ import { existsSync } from "node:fs";
+ import path from "node:path";
+@@ -11,8 +17,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
+ import { promisify } from "node:util";
+ 
+ const execFileAsync = promisify(execFile);
+-const SCAN_DURATION_MS = 1650;
+-const START_BUDGET_MS = 50;
++const SCAN_DURATION_MS = 1600;
++const START_BUDGET_MS = 28;
+ 
+ const here = path.dirname(fileURLToPath(import.meta.url));
+ 
+@@ -30,16 +36,18 @@ export class VisualScanManager {
+   }
+ 
+   isAvailable() {
+-    if (process.platform === "darwin") {
+-      return existsSync(this.#nativeBinaryPath());
+-    }
+     return true;
+   }
+ 
+   permissionState() {
+     if (process.platform === "darwin") {
+       const accessibility = systemPreferences.isTrustedAccessibilityClient(false);
+-      const screenCapture = systemPreferences.getMediaAccessStatus("screen") === "granted";
++      let screenCapture = false;
++      try {
++        screenCapture = systemPreferences.getMediaAccessStatus("screen") === "granted";
++      } catch {
++        screenCapture = true;
++      }
+       let mode = "minimalWave";
+       if (accessibility) mode = "fullAX";
+       else if (screenCapture) mode = "windowOnly";
+@@ -68,23 +76,38 @@ export class VisualScanManager {
+     return { ok: true, quality: this.quality };
+   }
+ 
++  getOverlayWindows() {
++    return this.overlayWindows.filter((win) => win && !win.isDestroyed());
++  }
++
+   /**
+-   * Fire-and-forget scan animation. Returns within ~50ms; animation continues in background.
+-   * @param {{ displayId?: number, quality?: string }} [options]
++   * Fire-and-forget scan. Returns within ~30ms; animation continues in background.
++   * @param {{ displayId?: number, quality?: string, preferNative?: boolean }} [options]
+    */
+   async start(options = {}) {
+     if (this.active) return { ok: true, alreadyRunning: true };
+     this.active = true;
+     const quality = options.quality || this.quality;
+     const started = Date.now();
++    const preferNative =
++      options.preferNative !== false &&
++      process.platform === "darwin" &&
++      existsSync(this.#nativeBinaryPath());
+ 
+     const run = async () => {
+       try {
+-        if (process.platform === "darwin" && existsSync(this.#nativeBinaryPath())) {
+-          await this.#startNative({ quality });
+-        } else {
+-          await this.#startElectronOverlay({ displayId: options.displayId, quality });
++        if (preferNative) {
++          try {
++            await this.#startNative({ quality, displayId: options.displayId });
++            return;
++          } catch (error) {
++            console.warn(
++              "[visual-scan] native start failed; using Electron overlay:",
++              error instanceof Error ? error.message : error,
++            );
++          }
+         }
++        await this.#startElectronOverlay({ displayId: options.displayId, quality });
+       } catch (error) {
+         this.active = false;
+         console.warn("[visual-scan] start failed:", error instanceof Error ? error.message : error);
+@@ -100,7 +123,7 @@ export class VisualScanManager {
+ 
+     return {
+       ok: true,
+-      backend: process.platform === "darwin" && existsSync(this.#nativeBinaryPath()) ? "native" : "electron",
++      backend: preferNative ? "native" : "electron",
+       startedMs: Date.now() - started,
+     };
+   }
+@@ -120,7 +143,7 @@ export class VisualScanManager {
+     }
+     for (const win of this.overlayWindows) {
+       try {
+-        if (win && !win.isDestroyed()) win.close();
++        if (win && !win.isDestroyed()) win.destroy();
+       } catch {
+         /* ignore */
+       }
+@@ -139,8 +162,8 @@ export class VisualScanManager {
+     return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
+   }
+ 
+-  async #startNative({ quality }) {
+-    const scene = await this.#buildScene({ quality });
++  async #startNative({ quality, displayId }) {
++    const scene = await this.#buildSceneFast({ displayId, quality });
+     const binary = this.#nativeBinaryPath();
+     const child = spawn(binary, ["start", "--quality", quality], {
+       stdio: ["pipe", "ignore", "ignore"],
+@@ -167,101 +190,153 @@ export class VisualScanManager {
+   }
+ 
+   async #startElectronOverlay({ displayId, quality }) {
+-    const scene = await this.#buildScene({ displayId, quality });
+-    const display = scene.display;
++    const targets =
++      displayId != null
++        ? [this.#targetDisplay(displayId)]
++        : screen.getAllDisplays();
++
++    // Build one lightweight scene per display — never call desktopCapturer here.
++    const scenes = await Promise.all(
++      targets.map((display) => this.#buildSceneFast({ displayId: display.id, quality })),
++    );
++
+     const overlayPath = path.join(here, "visual-scan-overlay.html");
+-    const sceneParam = encodeURIComponent(JSON.stringify(scene));
+-    const url = `${pathToFileURL(overlayPath).href}?scene=${sceneParam}`;
+-
+-    const win = new BrowserWindow({
+-      x: Math.round(display.x),
+-      y: Math.round(display.y),
+-      width: Math.round(display.width),
+-      height: Math.round(display.height),
+-      frame: false,
+-      transparent: true,
+-      resizable: false,
+-      movable: false,
+-      focusable: false,
+-      skipTaskbar: true,
+-      alwaysOnTop: true,
+-      hasShadow: false,
+-      show: false,
+-      webPreferences: {
+-        nodeIntegration: false,
+-        contextIsolation: true,
+-        backgroundThrottling: false,
+-      },
+-    });
+ 
+-    win.setIgnoreMouseEvents(true, { forward: true });
+-    win.setAlwaysOnTop(true, "screen-saver");
+-    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+-    this.overlayWindows.push(win);
++    for (const scene of scenes) {
++      const sceneParam = encodeURIComponent(JSON.stringify(scene));
++      const url = `${pathToFileURL(overlayPath).href}?scene=${sceneParam}`;
++      const display = scene.display;
++
++      /** @type {Electron.BrowserWindowConstructorOptions} */
++      const opts = {
++        x: Math.round(display.x),
++        y: Math.round(display.y),
++        width: Math.round(display.width),
++        height: Math.round(display.height),
++        frame: false,
++        transparent: true,
++        // Critical on macOS: without an explicit clear color the fullscreen
++        // overlay paints opaque black and appears to "hide all apps".
++        backgroundColor: "#00000000",
++        resizable: false,
++        movable: false,
++        focusable: false,
++        skipTaskbar: true,
++        alwaysOnTop: true,
++        hasShadow: false,
++        show: false,
++        fullscreenable: false,
++        thickFrame: false,
++        paintWhenInitiallyHidden: true,
++        webPreferences: {
++          nodeIntegration: false,
++          contextIsolation: true,
++          backgroundThrottling: false,
++          offscreen: false,
++        },
++      };
++      // Non-activating panel on macOS — never steals focus / Spaces.
++      if (process.platform === "darwin") {
++        opts.type = "panel";
++      }
+ 
+-    const loadPromise = win.loadURL(url);
+-    await Promise.race([
+-      loadPromise.catch(() => undefined),
+-      new Promise((resolve) => setTimeout(resolve, 120)),
+-    ]);
+-    if (!win.isDestroyed()) win.showInactive();
++      const win = new BrowserWindow(opts);
++
++      try {
++        win.setBackgroundColor("#00000000");
++      } catch {
++        /* ignore */
++      }
++      try {
++        win.setOpacity(1);
++      } catch {
++        /* ignore */
++      }
++      win.setIgnoreMouseEvents(true, { forward: true });
++      try {
++        win.setAlwaysOnTop(true, "screen-saver", 1);
++      } catch {
++        try {
++          win.setAlwaysOnTop(true, "pop-up-menu", 1);
++        } catch {
++          win.setAlwaysOnTop(true);
++        }
++      }
++      try {
++        win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
++      } catch {
++        /* ignore */
++      }
++      // Invisible to screencapture / Zoom / desktopCapturer — user still sees it.
++      try {
++        win.setContentProtection(true);
++      } catch {
++        /* Linux may no-op */
++      }
++
++      this.overlayWindows.push(win);
++
++      const loadPromise = win.loadURL(url);
++      await Promise.race([
++        loadPromise.catch(() => undefined),
++        new Promise((resolve) => setTimeout(resolve, 70)),
++      ]);
++      if (!win.isDestroyed()) {
++        // showInactive: never activate / never hide other apps via focus steal.
++        win.showInactive();
++        try {
++          win.setAlwaysOnTop(true, "screen-saver", 1);
++          win.moveTop();
++        } catch {
++          /* ignore */
++        }
++      }
++
++      win.on("closed", () => {
++        this.overlayWindows = this.overlayWindows.filter((w) => w !== win);
++        if (!this.overlayWindows.length && !this.nativeChild) this.active = false;
++      });
++    }
+ 
+     this.stopTimer = setTimeout(() => {
+       void this.stop();
+-    }, SCAN_DURATION_MS + 250);
+-
+-    win.on("closed", () => {
+-      this.overlayWindows = this.overlayWindows.filter((w) => w !== win);
+-      if (!this.overlayWindows.length && !this.nativeChild) this.active = false;
+-    });
++    }, SCAN_DURATION_MS + 220);
+   }
+ 
+-  async #buildScene({ displayId, quality = "high" }) {
+-    const cap = quality === "low" ? 40 : quality === "medium" ? 80 : 120;
++  /**
++   * Fast scene: synthetic detailed UI regions (+ optional Linux xdotool).
++   * Intentionally avoids desktopCapturer.getSources — that API on macOS can
++   * hitch Screen Recording, flash permission UI, and contribute to "blank"
++   * captures when paired with a fullscreen overlay.
++   */
++  async #buildSceneFast({ displayId, quality = "high" }) {
++    const cap = quality === "low" ? 40 : quality === "medium" ? 64 : 88;
+     const target = this.#targetDisplay(displayId);
+     const reduceMotion = this.#prefersReducedMotion();
+-    let contours = [];
+-
+-    try {
+-      const sources = await desktopCapturer.getSources({
+-        types: ["window", "screen"],
+-        thumbnailSize: { width: 320, height: 200 },
+-        fetchWindowIcons: false,
+-      });
+-
+-      const selfNames = /clyra|opencluely|visual scan|live transcription|ai response/i;
+-      const windowSources = sources.filter((s) => s.id.startsWith("window:") && !selfNames.test(s.name || ""));
+-      const linuxWindows = process.platform === "linux" ? await this.#linuxWindowGeometry() : [];
++    let contours = [...this.#syntheticWindowLayout(target.bounds)];
+ 
+-      for (const source of windowSources) {
+-        const match = linuxWindows.find((w) => this.#namesClose(w.title, source.name));
+-        if (match) {
+-          contours.push({ x: match.x, y: match.y, width: match.width, height: match.height });
+-          continue;
++    if (process.platform === "linux") {
++      try {
++        const linuxWindows = await Promise.race([
++          this.#linuxWindowGeometry(),
++          new Promise((resolve) => setTimeout(() => resolve([]), 120)),
++        ]);
++        for (const match of linuxWindows.slice(0, Math.min(28, cap))) {
++          contours.push({
++            x: match.x,
++            y: match.y,
++            width: match.width,
++            height: match.height,
++            importance:
++              match.width * match.height > target.bounds.width * target.bounds.height * 0.2
++                ? 1
++                : 0.7,
++            hierarchyDepth: 0,
++          });
+         }
+-        const thumb = source.thumbnail?.getSize?.() || { width: 0, height: 0 };
+-        if (thumb.width < 40 || thumb.height < 24) continue;
+-        const width = Math.min(thumb.width * 2, target.bounds.width * 0.92);
+-        const height = Math.min(thumb.height * 2, target.bounds.height * 0.88);
+-        const x = target.bounds.x + (target.bounds.width - width) / 2;
+-        const y = target.bounds.y + (target.bounds.height - height) / 2;
+-        contours.push({ x, y, width, height });
+-      }
+-
+-      if (!contours.length) {
+-        contours.push({
+-          x: target.bounds.x + target.bounds.width * 0.06,
+-          y: target.bounds.y + target.bounds.height * 0.06,
+-          width: target.bounds.width * 0.88,
+-          height: target.bounds.height * 0.88,
+-        });
++      } catch {
++        /* keep synthetic */
+       }
+-    } catch {
+-      /* geometry probe failed — fall back to minimal frame */
+-    }
+-
+-    if (contours.length < 8) {
+-      contours.push(...this.#minimalContours(target.bounds));
+     }
+ 
+     contours = this.#filterContours(contours, target.bounds, cap);
+@@ -272,6 +347,7 @@ export class VisualScanManager {
+         y: target.bounds.y,
+         width: target.bounds.width,
+         height: target.bounds.height,
++        scaleFactor: target.scaleFactor || 1,
+       },
+       contours,
+       quality,
+@@ -293,56 +369,95 @@ export class VisualScanManager {
+     return false;
+   }
+ 
+-  #minimalContours(bounds) {
+-    const inset = Math.min(bounds.width, bounds.height) * 0.08;
+-    const x = bounds.x + inset;
+-    const y = bounds.y + inset;
+-    const w = bounds.width - inset * 2;
+-    const h = bounds.height - inset * 2;
+-    return [
+-      { x, y, width: w, height: h },
+-      { x, y, width: w, height: 2 },
+-      { x, y: y + h - 2, width: w, height: 2 },
+-      { x, y, width: 2, height: h },
+-      { x: x + w - 2, y, width: 2, height: h },
++  /** Nested UI-structure regions that read as a real interface scan. */
++  #syntheticWindowLayout(bounds) {
++    const gx = bounds.x;
++    const gy = bounds.y;
++    const w = bounds.width;
++    const h = bounds.height;
++    const regions = [
++      // Primary app windows
++      { x: gx + w * 0.05, y: gy + h * 0.06, width: w * 0.46, height: h * 0.62, importance: 1, hierarchyDepth: 0 },
++      { x: gx + w * 0.52, y: gy + h * 0.1, width: w * 0.43, height: h * 0.66, importance: 1, hierarchyDepth: 0 },
++      // Title / toolbar strips
++      { x: gx + w * 0.05, y: gy + h * 0.06, width: w * 0.46, height: h * 0.055, importance: 0.75, hierarchyDepth: 1 },
++      { x: gx + w * 0.52, y: gy + h * 0.1, width: w * 0.43, height: h * 0.05, importance: 0.75, hierarchyDepth: 1 },
++      // Side nav / sidebar
++      { x: gx + w * 0.05, y: gy + h * 0.13, width: w * 0.11, height: h * 0.5, importance: 0.7, hierarchyDepth: 1 },
++      // Content panels
++      { x: gx + w * 0.18, y: gy + h * 0.14, width: w * 0.31, height: h * 0.22, importance: 0.65, hierarchyDepth: 2 },
++      { x: gx + w * 0.18, y: gy + h * 0.38, width: w * 0.31, height: h * 0.26, importance: 0.65, hierarchyDepth: 2 },
++      { x: gx + w * 0.55, y: gy + h * 0.18, width: w * 0.37, height: h * 0.12, importance: 0.55, hierarchyDepth: 2 },
++      { x: gx + w * 0.55, y: gy + h * 0.33, width: w * 0.18, height: h * 0.2, importance: 0.5, hierarchyDepth: 2 },
++      { x: gx + w * 0.75, y: gy + h * 0.33, width: w * 0.17, height: h * 0.2, importance: 0.5, hierarchyDepth: 2 },
++      // Rows / list items
++      { x: gx + w * 0.2, y: gy + h * 0.17, width: w * 0.26, height: h * 0.035, importance: 0.35, hierarchyDepth: 3 },
++      { x: gx + w * 0.2, y: gy + h * 0.22, width: w * 0.22, height: h * 0.035, importance: 0.35, hierarchyDepth: 3 },
++      { x: gx + w * 0.2, y: gy + h * 0.41, width: w * 0.27, height: h * 0.032, importance: 0.32, hierarchyDepth: 3 },
++      { x: gx + w * 0.2, y: gy + h * 0.46, width: w * 0.24, height: h * 0.032, importance: 0.32, hierarchyDepth: 3 },
++      { x: gx + w * 0.57, y: gy + h * 0.21, width: w * 0.2, height: h * 0.03, importance: 0.32, hierarchyDepth: 3 },
++      // Dock / taskbar strip + floating chrome
++      { x: gx + w * 0.22, y: gy + h * 0.92, width: w * 0.56, height: h * 0.05, importance: 0.55, hierarchyDepth: 0 },
++      { x: gx + w * 0.08, y: gy + h * 0.72, width: w * 0.38, height: h * 0.16, importance: 0.6, hierarchyDepth: 1 },
++      { x: gx + w * 0.54, y: gy + h * 0.78, width: w * 0.34, height: h * 0.1, importance: 0.45, hierarchyDepth: 1 },
++      // Buttons / chips
++      { x: gx + w * 0.58, y: gy + h * 0.56, width: w * 0.1, height: h * 0.04, importance: 0.28, hierarchyDepth: 3 },
++      { x: gx + w * 0.7, y: gy + h * 0.56, width: w * 0.1, height: h * 0.04, importance: 0.28, hierarchyDepth: 3 },
++      { x: gx + w * 0.82, y: gy + h * 0.56, width: w * 0.08, height: h * 0.04, importance: 0.28, hierarchyDepth: 3 },
+     ];
++    return regions;
+   }
+ 
+   #filterContours(contours, bounds, cap) {
+-    const minArea = Math.max(900, bounds.width * bounds.height * 0.00015);
+-    const seen = new Set();
++    const minArea = Math.max(400, bounds.width * bounds.height * 0.00008);
++    const seen = [];
+     const out = [];
+-    for (const rect of contours
+-      .filter((r) => r.width >= 24 && r.height >= 12 && r.width * r.height >= minArea)
+-      .sort((a, b) => b.width * b.height - a.width * a.height)) {
+-      const key = `${Math.round(rect.x)}:${Math.round(rect.y)}:${Math.round(rect.width)}:${Math.round(rect.height)}`;
+-      if (seen.has(key)) continue;
+-      seen.add(key);
++    const sorted = contours
++      .filter((r) => r.width >= 16 && r.height >= 10 && r.width * r.height >= minArea)
++      .sort(
++        (a, b) =>
++          (b.importance || 0) - (a.importance || 0) || b.width * b.height - a.width * a.height,
++      );
++
++    for (const rect of sorted) {
++      const duplicate = seen.some((other) => this.#iou(rect, other) > 0.92);
++      if (duplicate) continue;
++      seen.push(rect);
+       out.push(rect);
+       if (out.length >= cap) break;
+     }
+     return out;
+   }
+ 
++  #iou(a, b) {
++    const x1 = Math.max(a.x, b.x);
++    const y1 = Math.max(a.y, b.y);
++    const x2 = Math.min(a.x + a.width, b.x + b.width);
++    const y2 = Math.min(a.y + a.height, b.y + b.height);
++    const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
++    const union = a.width * a.height + b.width * b.height - inter;
++    return union <= 0 ? 0 : inter / union;
++  }
++
+   async #linuxWindowGeometry() {
+     const display = process.env.DISPLAY || ":0";
+     const env = { ...process.env, DISPLAY: display };
+     try {
+-      const { stdout } = await execFileAsync("xdotool", ["search", "--name", "."], {
+-        timeout: 4000,
++      const { stdout } = await execFileAsync("xdotool", ["search", "--onlyvisible", "--name", "."], {
++        timeout: 400,
+         env,
+         encoding: "utf8",
+-      });
++      }).catch(() => ({ stdout: "" }));
+       const ids = String(stdout || "")
+         .trim()
+         .split(/\s+/)
+         .filter(Boolean)
+-        .slice(0, 80);
++        .slice(0, 18);
+       const windows = [];
+       for (const id of ids) {
+         try {
+           const { stdout: geom } = await execFileAsync("xdotool", ["getwindowgeometry", "--shell", id], {
+-            timeout: 1500,
++            timeout: 300,
+             env,
+             encoding: "utf8",
+           });
+@@ -353,10 +468,14 @@ export class VisualScanManager {
+               .map((line) => line.split("="))
+               .filter((p) => p.length === 2),
+           );
+-          const title = await execFileAsync("xdotool", ["getwindowname", id], { timeout: 1500, env, encoding: "utf8" })
++          const title = await execFileAsync("xdotool", ["getwindowname", id], {
++            timeout: 300,
++            env,
++            encoding: "utf8",
++          })
+             .then((r) => String(r.stdout || "").trim())
+             .catch(() => "");
+-          if (/clyra|opencluely/i.test(title)) continue;
++          if (/clyra|opencluely|visual scan/i.test(title)) continue;
+           windows.push({
+             id,
+             title,
+@@ -366,21 +485,14 @@ export class VisualScanManager {
+             height: Number(vals.HEIGHT) || 0,
+           });
+         } catch {
+-          /* skip window */
++          /* skip */
+         }
+       }
+-      return windows.filter((w) => w.width >= 200 && w.height >= 120);
++      return windows.filter((w) => w.width >= 160 && w.height >= 90);
+     } catch {
+       return [];
+     }
+   }
+-
+-  #namesClose(a = "", b = "") {
+-    const left = String(a).toLowerCase().trim();
+-    const right = String(b).toLowerCase().trim();
+-    if (!left || !right) return false;
+-    return left.includes(right) || right.includes(left);
+-  }
+ }
+ 
+ let singleton = null;
+@@ -393,10 +505,8 @@ export function getVisualScanManager(options = {}) {
+   return singleton;
+ }
+ 
+-/**
+- * Fire-and-forget helper for OpenCluely bridge (CJS-friendly dynamic import target).
+- */
+-export async function fireVisualScan(options = {}) {
++export function fireVisualScan(options = {}) {
+   const manager = getVisualScanManager(options);
+-  return manager.start(options);
++  void manager.start(options);
++  return { ok: true };
+ }
+diff --git a/electron/visual-scan-overlay.html b/electron/visual-scan-overlay.html
+index a6e4ab5..9e183d9 100644
+--- a/electron/visual-scan-overlay.html
++++ b/electron/visual-scan-overlay.html
+@@ -10,99 +10,198 @@
+       width: 100%;
+       height: 100%;
+       overflow: hidden;
+-      background: transparent;
++      background: transparent !important;
+       pointer-events: none;
+     }
+     canvas {
+       display: block;
+       width: 100%;
+       height: 100%;
++      background: transparent !important;
+     }
+   </style>
+ </head>
+ <body>
+   <canvas id="scan"></canvas>
+   <script>
+-    const DURATION_MS = 1650;
+-    const ICE = "rgba(224, 236, 248, ";
+-    const WAVE = "rgba(242, 248, 255, ";
++    /**
++     * Butter-smooth Visual Intelligence Scan (Electron path).
++     * Single rAF clock, precomputed Path2D, no shadowBlur, ≤3 wave strokes/frame.
++     * Icy white/blue — Apple-like structure reveal, not radar/HUD/neon.
++     */
++    const DURATION_MS = 1600;
++    const CENTER_MS = 110;
++    const FADE_TAIL = 0.2;
+ 
+-    function easeOutCubic(t) {
+-      return 1 - Math.pow(1 - t, 3);
++    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
++    // Smooth quintic ease-out — less "robotic" than cubic.
++    const easeOut = (t) => {
++      const u = 1 - t;
++      return 1 - u * u * u * u * u;
++    };
++    const easeInOut = (t) =>
++      t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
++
++    function roundedPath(x, y, w, h, r) {
++      const radius = Math.min(r, w * 0.5, h * 0.5);
++      const p = new Path2D();
++      p.moveTo(x + radius, y);
++      p.arcTo(x + w, y, x + w, y + h, radius);
++      p.arcTo(x + w, y + h, x, y + h, radius);
++      p.arcTo(x, y + h, x, y, radius);
++      p.arcTo(x, y, x + w, y, radius);
++      p.closePath();
++      return p;
+     }
+ 
+-    function drawRoundedRect(ctx, x, y, w, h, r) {
+-      const radius = Math.min(r, w / 2, h / 2);
+-      ctx.beginPath();
+-      ctx.moveTo(x + radius, y);
+-      ctx.lineTo(x + w - radius, y);
+-      ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+-      ctx.lineTo(x + w, y + h - radius);
+-      ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+-      ctx.lineTo(x + radius, y + h);
+-      ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+-      ctx.lineTo(x, y + radius);
+-      ctx.quadraticCurveTo(x, y, x + radius, y);
+-      ctx.closePath();
++    function minDistToRect(ox, oy, r) {
++      const cx = clamp(ox, r.x, r.x + r.width);
++      const cy = clamp(oy, r.y, r.y + r.height);
++      return Math.hypot(cx - ox, cy - oy);
+     }
+ 
+     function startScan(scene) {
+       const canvas = document.getElementById("scan");
+       const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+-      const dpr = window.devicePixelRatio || 1;
++      const dpr = Math.min(2, window.devicePixelRatio || 1);
+       const width = Math.max(1, Math.round(scene.display.width));
+       const height = Math.max(1, Math.round(scene.display.height));
+       canvas.width = Math.round(width * dpr);
+       canvas.height = Math.round(height * dpr);
+       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
++      ctx.imageSmoothingEnabled = true;
++      ctx.lineJoin = "round";
++      ctx.lineCap = "round";
+ 
+-      const center = { x: width / 2, y: height / 2 };
+-      const maxRadius = Math.hypot(width, height) * 0.55;
+-      const contours = (scene.contours || []).map((r) => ({
+-        x: r.x - scene.display.x,
+-        y: r.y - scene.display.y,
+-        width: r.width,
+-        height: r.height,
+-        dist: Math.hypot(r.x + r.width / 2 - scene.display.x - center.x, r.y + r.height / 2 - scene.display.y - center.y),
+-      }));
+-      const maxDist = Math.max(1, ...contours.map((c) => c.dist), 1);
++      const ox = width * 0.5;
++      const oy = height * 0.5;
++      const maxRadius = Math.hypot(Math.max(ox, width - ox), Math.max(oy, height - oy)) + 8;
+       const reduceMotion = Boolean(scene.reduceMotion);
+ 
++      const contours = (scene.contours || [])
++        .slice(0, 88)
++        .map((raw, index) => {
++          const x = raw.x - scene.display.x;
++          const y = raw.y - scene.display.y;
++          const w = raw.width;
++          const h = raw.height;
++          const area = w * h;
++          const importance =
++            raw.importance != null
++              ? raw.importance
++              : area > width * height * 0.18
++                ? 1
++                : area > width * height * 0.05
++                  ? 0.65
++                  : 0.35;
++          const radius =
++            importance >= 1 ? Math.min(12, Math.min(w, h) * 0.08)
++            : importance >= 0.6 ? Math.min(9, Math.min(w, h) * 0.12)
++            : Math.min(6, Math.min(w, h) * 0.16);
++          const activation = minDistToRect(ox, oy, { x, y, width: w, height: h });
++          const peri = 2 * (w + h);
++          const depth = Number(raw.hierarchyDepth) || (index % 3);
++          return {
++            path: roundedPath(x, y, w, h, radius),
++            activation,
++            peri,
++            importance,
++            depth,
++            peak: importance >= 1 ? 0.5 : importance >= 0.6 ? 0.34 : 0.2,
++            traceDur: clamp(peri / 5600, 0.09, 0.22),
++            lineWidth: importance >= 1 ? 1.2 : importance >= 0.6 ? 1.05 : 0.9,
++          };
++        })
++        .sort((a, b) => a.activation - b.activation);
++
+       const started = performance.now();
+       let raf = 0;
+ 
+       function frame(now) {
+         const elapsed = now - started;
+-        const t = Math.min(1, elapsed / DURATION_MS);
++        const t = clamp(elapsed / DURATION_MS, 0, 1);
+         ctx.clearRect(0, 0, width, height);
+ 
++        if (elapsed < CENTER_MS + 80) {
++          const p = clamp(elapsed / CENTER_MS, 0, 1);
++          const fade = elapsed > CENTER_MS ? 1 - (elapsed - CENTER_MS) / 80 : 1;
++          const r = 1.2 + easeOut(p) * 14;
++          const g = ctx.createRadialGradient(ox, oy, 0, ox, oy, r);
++          g.addColorStop(0, `rgba(255,255,255,${0.55 * fade})`);
++          g.addColorStop(0.5, `rgba(230,240,255,${0.16 * fade})`);
++          g.addColorStop(1, "rgba(200,220,255,0)");
++          ctx.fillStyle = g;
++          ctx.beginPath();
++          ctx.arc(ox, oy, r, 0, Math.PI * 2);
++          ctx.fill();
++        }
++
+         if (reduceMotion) {
+-          const pulse = Math.sin((elapsed / DURATION_MS) * Math.PI) * 0.28;
+-          ctx.fillStyle = WAVE + pulse + ")";
+-          ctx.fillRect(0, 0, width, height);
++          for (const c of contours) {
++            const local = clamp((t - c.activation / maxRadius) / 0.28, 0, 1);
++            if (local <= 0) continue;
++            ctx.globalAlpha = 0.16 * easeInOut(local) * (1 - t * 0.5);
++            ctx.strokeStyle = "rgb(230,240,255)";
++            ctx.lineWidth = c.lineWidth;
++            ctx.stroke(c.path);
++          }
++          ctx.globalAlpha = 1;
+         } else {
+-          const waveT = easeOutCubic(Math.min(1, t / 0.82));
+-          const radius = maxRadius * waveT;
+-          const waveAlpha = 0.42 * (1 - Math.max(0, (t - 0.45) / 0.55));
+-          if (waveAlpha > 0.01) {
++          const scanT = easeOut(clamp((elapsed - 80) / (DURATION_MS - 140), 0, 1));
++          const radius = maxRadius * scanT;
++          const waveFade = 1 - clamp((t - (1 - FADE_TAIL)) / FADE_TAIL, 0, 1);
++
++          if (elapsed > 70 && waveFade > 0.02) {
++            ctx.globalAlpha = 0.48 * waveFade;
++            ctx.strokeStyle = "rgb(255,255,255)";
++            ctx.lineWidth = 1.1;
+             ctx.beginPath();
+-            ctx.arc(center.x, center.y, Math.max(2, radius), 0, Math.PI * 2);
+-            ctx.strokeStyle = WAVE + waveAlpha + ")";
+-            ctx.lineWidth = 1.6;
++            ctx.arc(ox, oy, Math.max(0.5, radius), 0, Math.PI * 2);
+             ctx.stroke();
+-          }
+ 
+-          for (const rect of contours) {
+-            const reveal = rect.dist / maxDist;
+-            const localT = (t - reveal * 0.72) / 0.22;
+-            if (localT <= 0) continue;
+-            const alpha = Math.max(0, Math.min(0.72, localT) * (1 - Math.max(0, (t - 0.78) / 0.22)));
+-            if (alpha <= 0.01) continue;
+-            ctx.strokeStyle = ICE + alpha + ")";
+-            ctx.lineWidth = 1.1;
+-            drawRoundedRect(ctx, rect.x, rect.y, rect.width, rect.height, 3);
++            ctx.globalAlpha = 0.12 * waveFade;
++            ctx.strokeStyle = "rgb(210,228,255)";
++            ctx.lineWidth = 2.8;
++            ctx.beginPath();
++            ctx.arc(ox, oy, Math.max(0.5, radius), 0, Math.PI * 2);
+             ctx.stroke();
++
++            const micro = radius - maxRadius * (48 / DURATION_MS);
++            if (micro > 12) {
++              ctx.globalAlpha = 0.09 * waveFade;
++              ctx.strokeStyle = "rgb(225,238,255)";
++              ctx.lineWidth = 1;
++              ctx.beginPath();
++              ctx.arc(ox, oy, micro, 0, Math.PI * 2);
++              ctx.stroke();
++            }
++            ctx.globalAlpha = 1;
++          }
++
++          for (const c of contours) {
++            const activateAt = c.activation / maxRadius + c.depth * 0.004;
++            const delta = t - activateAt;
++            if (delta < 0) continue;
++            const draw = clamp(delta / c.traceDur, 0, 1);
++            const fadeStart = activateAt + c.traceDur + 0.02;
++            const fade = t < fadeStart ? 1 : 1 - clamp((t - fadeStart) / FADE_TAIL, 0, 1);
++            if (fade <= 0.01) continue;
++
++            const waveGap = Math.abs(radius - c.activation);
++            const boost = Math.exp(-(waveGap * waveGap) / 1600);
++            const alpha = (c.peak * 0.5 + c.peak * 0.5 * boost) * fade * easeOut(draw);
++            if (alpha < 0.018) continue;
++
++            const len = Math.max(40, c.peri);
++            ctx.globalAlpha = alpha;
++            ctx.strokeStyle = "rgb(238,245,255)";
++            ctx.lineWidth = c.lineWidth;
++            ctx.setLineDash([len * draw, len]);
++            ctx.lineDashOffset = 0;
++            ctx.stroke(c.path);
+           }
++          ctx.setLineDash([]);
++          ctx.globalAlpha = 1;
+         }
+ 
+         if (t < 1) {
+diff --git a/native/visual-scan/Sources/VisualScan/OverlayPanel.swift b/native/visual-scan/Sources/VisualScan/OverlayPanel.swift
+index 27377f9..172e00f 100644
+--- a/native/visual-scan/Sources/VisualScan/OverlayPanel.swift
++++ b/native/visual-scan/Sources/VisualScan/OverlayPanel.swift
+@@ -32,9 +32,13 @@ final class OverlayPanel: NSPanel {
+         isReleasedWhenClosed = true
+         hidesOnDeactivate = false
+         becomesKeyOnlyIfNeeded = true
++        // Exclude from screencapture / Zoom — user still sees the animation.
++        // This prevents "what's on my screen" from photographing the scan overlay.
++        sharingType = .none
+ 
+         let content = NSView(frame: CGRect(origin: .zero, size: display.size))
+         content.wantsLayer = true
++        content.layer?.backgroundColor = NSColor.clear.cgColor
+         content.layer?.addSublayer(animationController.layer)
+         contentView = content
+     }
+diff --git a/scripts/opencluely-bridge/capture.service.js b/scripts/opencluely-bridge/capture.service.js
+index 5cb2459..b89db7a 100644
+--- a/scripts/opencluely-bridge/capture.service.js
++++ b/scripts/opencluely-bridge/capture.service.js
+@@ -39,7 +39,18 @@ class CaptureService {
+     this.isProcessing = true;
+     const startTime = Date.now();
+     try {
+-      const { image, metadata } = await this.captureScreenshot(options);
++      let image;
++      let metadata;
++      try {
++        ({ image, metadata } = await this.captureScreenshot(options));
++      } catch (primaryError) {
++        // If native capture looked black (overlay race) or failed, fall back once.
++        logger.warn('Primary capture failed; retrying via desktopCapturer', {
++          error: primaryError.message
++        });
++        const targetDisplay = this._getTargetDisplay(options.displayId);
++        ({ image, metadata } = await this._captureWithDesktopCapturer(targetDisplay, options));
++      }
+ 
+       let finalImage = image;
+       if (options.area && this._isValidArea(options.area)) {
+@@ -50,6 +61,11 @@ class CaptureService {
+         }
+       }
+ 
++      // Final guard: refuse empty/black frames so the LLM never "sees" a blank overlay.
++      if (this._looksMostlyBlack(finalImage)) {
++        throw new Error('Captured frame looked empty/black — real desktop was not visible');
++      }
++
+       const buffer = finalImage.toPNG();
+       try {
+         fs.writeFileSync(path.join(os.tmpdir(), 'oc-last-capture.png'), buffer);
+@@ -182,21 +198,59 @@ class CaptureService {
+ 
+   _captureMacNative(targetDisplay) {
+     const outPath = path.join(os.tmpdir(), `oc-screencapture-${process.pid}-${Date.now()}.png`);
+-    execFileSync('screencapture', ['-x', outPath], { timeout: 20000 });
++    // Capture the interactive display only. Never use UI that hides other apps.
++    // -x: no shutter sound. -D: display number (1-based for screencapture).
++    const displays = screen.getAllDisplays();
++    const index = Math.max(0, displays.findIndex((d) => d.id === targetDisplay.id));
++    const displayNumber = String(index + 1);
++    try {
++      execFileSync('screencapture', ['-x', '-D', displayNumber, outPath], { timeout: 20000 });
++    } catch (error) {
++      // Fallback without -D for older macOS.
++      execFileSync('screencapture', ['-x', outPath], { timeout: 20000 });
++    }
+     const image = this._loadPng(outPath);
+-    logger.info('Using macOS screencapture', { imageSize: image.getSize() });
++    const size = image.getSize();
++    if (size.width < 32 || size.height < 32) {
++      throw new Error('macOS screencapture returned an empty/too-small image');
++    }
++    // Reject near-black frames (usually means we photographed a black overlay).
++    if (this._looksMostlyBlack(image)) {
++      throw new Error('macOS screencapture looked empty/black — overlay may have been included');
++    }
++    logger.info('Using macOS screencapture', { imageSize: size, displayNumber });
+     return {
+       image,
+       metadata: {
+         displayId: targetDisplay.id,
+         sourceName: 'screencapture',
+         method: 'macos-screencapture',
+-        dimensions: image.getSize(),
++        dimensions: size,
+         captureTime: new Date().toISOString()
+       }
+     };
+   }
+ 
++  _looksMostlyBlack(image) {
++    try {
++      const sample = image.resize({ width: 32, height: 18 });
++      const { width, height } = sample.getSize();
++      const buf = sample.toBitmap();
++      // Electron bitmap is BGRA on most platforms.
++      let dark = 0;
++      const pixels = width * height;
++      for (let i = 0; i < buf.length; i += 4) {
++        const b = buf[i];
++        const g = buf[i + 1];
++        const r = buf[i + 2];
++        if (r + g + b < 36) dark += 1;
++      }
++      return dark / Math.max(1, pixels) > 0.92;
++    } catch (_) {
++      return false;
++    }
++  }
++
+   _captureWindowsNative(targetDisplay) {
+     const outPath = path.join(os.tmpdir(), `oc-win-capture-${process.pid}-${Date.now()}.png`);
+     const escaped = outPath.replace(/'/g, "''");
+diff --git a/scripts/opencluely-bridge/html/index.html b/scripts/opencluely-bridge/html/index.html
+index a8387b8..c790b70 100644
+--- a/scripts/opencluely-bridge/html/index.html
++++ b/scripts/opencluely-bridge/html/index.html
+@@ -4,7 +4,7 @@
+     <meta charset="UTF-8" />
+     <title>OpenCluely</title>
+     <link href="./dist/output.css" rel="stylesheet" />
+-    <link href="./src/styles/common.css" rel="stylesheet" />
++    <!-- common.css intentionally omitted: donor chat styles fight the light Clyra bar -->
+     <style>
+       :root {
+         --oc-glass: rgba(248, 249, 251, 0.88);
+@@ -132,46 +132,30 @@
+         from { opacity: 0.72; }
+         to { opacity: 1; }
+       }
+-      /* Subtle blue glow line traveling the full border while AI thinks */
+-      .oc-shell.is-thinking::before {
+-        content: "";
++      /* Thinking border glow — SVG stroke travels full perimeter (reliable in Electron) */
++      .oc-think-glow {
+         position: absolute;
+         inset: 0;
+-        border-radius: inherit;
+-        padding: 1.5px;
+-        background: conic-gradient(from var(--oc-glow-angle, 0deg), transparent 0%, transparent 62%, rgba(59,130,246,0.05) 72%, var(--oc-glow) 86%, rgba(225,238,255,0.85) 92%, transparent 100%);
+-        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+-        -webkit-mask-composite: xor;
+-        mask-composite: exclude;
++        width: 100%;
++        height: 100%;
+         pointer-events: none;
+-        z-index: 8;
+-        animation: oc-glow-spin 1.8s linear infinite;
+-        opacity: 0.9;
+-      }
+-      @property --oc-glow-angle {
+-        syntax: "<angle>";
+-        inherits: false;
+-        initial-value: 0deg;
+-      }
+-      @keyframes oc-glow-spin {
+-        to { --oc-glow-angle: 360deg; }
+-      }
+-      @supports not (background: conic-gradient(from var(--oc-glow-angle), #000, #fff)) {
+-        .oc-shell.is-thinking::before {
+-          background: linear-gradient(90deg, transparent, rgba(59,130,246,0.35), rgba(225,238,255,0.7), rgba(59,130,246,0.35), transparent);
+-          background-size: 200% 100%;
+-          animation: oc-glow-slide 1.6s linear infinite;
+-          -webkit-mask: none;
+-          mask: none;
+-          border-radius: inherit;
+-          padding: 0;
+-          border: 1.5px solid transparent;
+-          opacity: 0.55;
+-        }
+-        @keyframes oc-glow-slide {
+-          0% { background-position: 100% 0; }
+-          100% { background-position: -100% 0; }
+-        }
++        z-index: 9;
++        opacity: 0;
++        transition: opacity 180ms ease;
++        overflow: visible;
++      }
++      .oc-shell.is-thinking .oc-think-glow { opacity: 1; }
++      .oc-think-glow rect {
++        fill: none;
++        stroke: url(#ocGlowGrad);
++        stroke-width: 1.75;
++        stroke-linecap: round;
++        stroke-dasharray: 72 520;
++        animation: oc-glow-dash 1.65s linear infinite;
++        filter: drop-shadow(0 0 3px rgba(59,130,246,0.35));
++      }
++      @keyframes oc-glow-dash {
++        to { stroke-dashoffset: -592; }
+       }
+ 
+       .oc-shell.is-boot-squish {
+@@ -328,8 +312,9 @@
+       .oc-shell.is-wide .command-tab,
+       .oc-shell.is-chat-open .command-tab {
+         /* Keep left/right chrome optically balanced when expanded */
+-        padding-inline: 10px;
++        padding-inline: 12px;
+       }
++      .command-tab { padding-right: 10px !important; }
+       .oc-shell.is-chat-open .oc-drag,
+       .oc-shell.is-wide .oc-drag {
+         margin-left: 0;
+@@ -840,10 +825,53 @@
+       .oc-shell.is-animating {
+         will-change: width, transform, opacity, height;
+       }
++
++      /* Final chat-parity overrides (beat any residual donor styles) */
++      .chat-messages .message,
++      .chat-messages .message.assistant,
++      .chat-messages .message.system,
++      .chat-messages .message.thinking {
++        background: transparent !important;
++        border: none !important;
++        border-left: none !important;
++        box-shadow: none !important;
++        backdrop-filter: none !important;
++        padding: 2px 2px 0 !important;
++        margin: 0 !important;
++        border-radius: 0 !important;
++      }
++      .chat-messages .message.assistant .message-text,
++      .chat-messages .message.system .message-text,
++      .chat-messages .message.thinking .message-text,
++      .chat-messages .thinking-row {
++        color: var(--oc-assistant-fg) !important;
++        text-shadow: none !important;
++        background: transparent !important;
++      }
++      .chat-messages .message.assistant .message-text strong {
++        color: var(--oc-text-strong) !important;
++        font-weight: 650;
++      }
++      .chat-messages .message.user {
++        background: transparent !important;
++        border: none !important;
++        padding: 0 !important;
++      }
+     </style>
+   </head>
+   <body data-oc-light-bar="1">
+     <div class="oc-shell is-boot-squish" id="ocShell">
++      <svg class="oc-think-glow" aria-hidden="true" preserveAspectRatio="none">
++        <defs>
++          <linearGradient id="ocGlowGrad" x1="0%" y1="0%" x2="100%" y2="0%">
++            <stop offset="0%" stop-color="rgba(225,238,255,0)"/>
++            <stop offset="45%" stop-color="rgba(195,220,255,0.55)"/>
++            <stop offset="70%" stop-color="rgba(59,130,246,0.95)"/>
++            <stop offset="100%" stop-color="rgba(225,238,255,0)"/>
++          </linearGradient>
++        </defs>
++        <rect x="1" y="1" width="100%" height="100%" rx="22" ry="22" pathLength="592" vector-effect="non-scaling-stroke"/>
++      </svg>
+       <div class="command-tab" id="commandTab">
+         <button type="button" class="oc-close oc-boot-hide" id="ocCloseBtn" title="Close" aria-label="Close">
+           <svg class="oc-icon-x" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+diff --git a/scripts/opencluely-bridge/main.js b/scripts/opencluely-bridge/main.js
+index 10b093f..f6f0269 100644
+--- a/scripts/opencluely-bridge/main.js
++++ b/scripts/opencluely-bridge/main.js
+@@ -54,20 +54,23 @@ function formatEnvValue(raw) {
+ // This kills the entire app and can leave orphan helper processes that
+ // exhaust the X11 client limit, producing "Maximum number of clients reached".
+ //
+-// Disabling hardware acceleration and the GPU subprocess forces Chromium to
+-// render via the CPU (SwiftShader). OpenCluely's UI is light enough that
+-// this is imperceptible, and it eliminates the GPU crash entirely.
++// We disable the GPU *subprocess* but MUST keep compositing + transparent
++// visuals enabled — otherwise the Visual Intelligence Scan fullscreen overlay
++// paints opaque black and appears to "hide all apps".
+ if (process.platform === "linux") {
+   app.disableHardwareAcceleration();
++  app.commandLine.appendSwitch("enable-transparent-visuals");
+   app.commandLine.appendSwitch("disable-gpu");
+-  app.commandLine.appendSwitch("disable-gpu-compositing");
+-  app.commandLine.appendSwitch("disable-software-rasterizer");
++  // Do NOT set disable-gpu-compositing — breaks BrowserWindow transparency.
+   app.commandLine.appendSwitch("disable-gpu-sandbox");
+   // On X11 only; harmless on Wayland. Prevents Chromium from spawning a
+   // compositor process that adds another X11 client.
+   app.commandLine.appendSwitch("in-process-gpu");
+ }
+ 
++// macOS / Windows: ensure transparent overlays (scan) composite correctly.
++app.commandLine.appendSwitch("enable-transparent-visuals");
++
+ // Keep Chromium network noise out of the terminal; app-level logs still go through Winston.
+ app.commandLine.appendSwitch("log-level", "3");
+ app.commandLine.appendSwitch("disable-background-networking");
+@@ -1369,27 +1372,46 @@ class ApplicationController {
+     );
+   }
+ 
++  /**
++   * Capture the real desktop WITHOUT hiding apps/windows.
++   * Hiding Electron overlays causes macOS focus/Space flicker that looks like
++   * "all apps disappeared". Instead we content-protect our overlays so they
++   * are omitted from the screenshot while remaining visible to the user.
++   */
+   async #captureForAgent() {
+-    const hiddenForCapture = [];
++    return this.#captureDesktopWithoutHiding({ fullScreen: true });
++  }
++
++  async #captureDesktopWithoutHiding(options = {}) {
++    const protectedWindows = [];
++    const restoreStealth = Boolean(this.stealthEnabled);
+     try {
+-      for (const [type, win] of windowManager.windows.entries()) {
+-        if (!win || win.isDestroyed()) continue;
+-        if (type === "main" || type === "chat" || type === "llmResponse" || type === "settings") {
+-          if (win.isVisible()) {
+-            hiddenForCapture.push(win);
+-            win.hide();
+-          }
++      // Never photograph an in-flight scan overlay. Stop it first — do not hide apps.
++      try {
++        await visualScanBridge.stop();
++      } catch (_) {
++        /* ignore */
++      }
++
++      for (const win of windowManager.windows.values()) {
++        if (!win || win.isDestroyed() || !win.isVisible()) continue;
++        try {
++          win.setContentProtection(true);
++          protectedWindows.push(win);
++        } catch (_) {
++          /* platform may not support content protection */
+         }
+       }
+-      await new Promise((r) => setTimeout(r, 100));
+-      // Full-screen capture so vision coordinates match the OS display
+-      return await captureService.captureAndProcess({ fullScreen: true });
++      // One frame so the compositor applies protection before capture.
++      await new Promise((r) => setTimeout(r, 40));
++      return await captureService.captureAndProcess({
++        fullScreen: true,
++        ...options,
++      });
+     } finally {
+-      for (const win of hiddenForCapture) {
++      for (const win of protectedWindows) {
+         try {
+-          if (!win.isDestroyed()) {
+-            windowManager.showOnCurrentDesktop(win, { focus: false, inactive: true });
+-          }
++          if (!win.isDestroyed()) win.setContentProtection(restoreStealth);
+         } catch (_) {
+           /* ignore */
+         }
+@@ -1609,47 +1631,30 @@ class ApplicationController {
+       return;
+     }
+ 
+-    // Visual Intelligence Scan — fire-and-forget, does not block capture.
+-    visualScanBridge.fireVisualScan();
+-
+     const startTime = Date.now();
+ 
+     try {
+       windowManager.showLLMLoading();
+ 
+-      // Hide OpenCluely overlays briefly so capture sees the real app (Chrome),
+-      // not our own glass windows — otherwise vision hallucinates.
+-      const hiddenForCapture = [];
+-      try {
+-        for (const [type, win] of windowManager.windows.entries()) {
+-          if (!win || win.isDestroyed()) continue;
+-          if (type === "main" || type === "chat" || type === "llmResponse" || type === "settings") {
+-            if (win.isVisible()) {
+-              hiddenForCapture.push(win);
+-              win.hide();
+-            }
+-          }
+-        }
+-        await new Promise((r) => setTimeout(r, 120));
+-      } catch (_) {
+-        /* ignore */
+-      }
+-
++      // CRITICAL ORDER:
++      // 1) Capture the real desktop FIRST (never hide apps — that blanks macOS).
++      // 2) THEN start the Visual Intelligence Scan (content-protected overlay).
++      // Previously the scan overlay covered the screen *during* capture, so the
++      // model received a black/empty frame and users saw apps "disappear".
+       let capture;
+       try {
+-        capture = await captureService.captureAndProcess();
+-      } finally {
+-        for (const win of hiddenForCapture) {
+-          try {
+-            if (!win.isDestroyed()) {
+-            windowManager.showOnCurrentDesktop(win, { focus: false, inactive: true });
+-          }
+-          } catch (_) {
+-            /* ignore */
+-          }
+-        }
++        capture = await this.#captureDesktopWithoutHiding({ fullScreen: true });
++      } catch (captureError) {
++        logger.warn("Protected capture failed; retrying plain capture", {
++          error: captureError.message,
++        });
++        capture = await captureService.captureAndProcess({ fullScreen: true });
+       }
+ 
++      // Fire scan after pixels are safe — overlay is front-most but excluded
++      // from future captures via setContentProtection.
++      visualScanBridge.fireVisualScan();
++
+       if (!capture.imageBuffer || !capture.imageBuffer.length) {
+         windowManager.hideLLMResponse();
+         this.broadcastOCRError("Failed to capture screenshot image");
+diff --git a/scripts/opencluely-bridge/ui/bar-chat.js b/scripts/opencluely-bridge/ui/bar-chat.js
+index ecbc27a..76cbb9b 100644
+--- a/scripts/opencluely-bridge/ui/bar-chat.js
++++ b/scripts/opencluely-bridge/ui/bar-chat.js
+@@ -131,8 +131,28 @@
+ 
+   function setThinkingChrome(on) {
+     shell.classList.toggle('is-thinking', Boolean(on));
++    if (on) syncThinkGlowGeometry();
+   }
+ 
++  function syncThinkGlowGeometry() {
++    try {
++      const svg = shell.querySelector('.oc-think-glow');
++      const rect = svg?.querySelector('rect');
++      if (!svg || !rect) return;
++      const r = shell.getBoundingClientRect();
++      const radius = open || wide ? 22 : 999;
++      svg.setAttribute('viewBox', `0 0 ${Math.max(1, r.width)} ${Math.max(1, r.height)}`);
++      rect.setAttribute('width', String(Math.max(1, r.width - 2)));
++      rect.setAttribute('height', String(Math.max(1, r.height - 2)));
++      rect.setAttribute('rx', String(open || wide ? 22 : Math.min(26, r.height / 2)));
++      rect.setAttribute('ry', String(open || wide ? 22 : Math.min(26, r.height / 2)));
++    } catch (_) {
++      /* ignore */
++    }
++  }
++
++
++
+   function showThinking() {
+     hideThinking();
+     setThinkingChrome(true);
+@@ -299,6 +319,7 @@
+       animating = false;
+     }
+ 
++    syncThinkGlowGeometry();
+     if (nextMode === 'ask') {
+       // Focus immediately — no artificial delay.
+       inputEl?.focus();
+@@ -621,8 +642,8 @@
+     autoGrow();
+     showThinking();
+     try {
+-      const screenAsk = /\b(what('?s| is) on (my )?screen|on my screen|look at (my )?screen|what do you see|describe (the |my )?(screen|desktop)|screenshot)\b/i.test(text);
+-      if (screenAsk) void window.electronAPI?.visualScan?.start?.();
++      // Do NOT start the visual scan here. Main captures the real desktop first,
++      // then fires the scan. Starting early covers the screen and yields black frames.
+       await window.electronAPI?.sendChatMessage?.(text);
+     } catch (error) {
+       hideThinking();
+@@ -636,9 +657,7 @@
+     addMessage('Auto Answer — reading your screen…', 'system');
+     showThinking();
+     try {
+-      // Premium Visual Intelligence scan (fire-and-forget; main also triggers).
+-      void window.electronAPI?.visualScan?.start?.();
+-      // Prefer dedicated control endpoint when available
++      // Scan is started by main AFTER a real desktop capture (not here).
+       const res = await fetch('http://127.0.0.1:3847/auto-answer', {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+diff --git a/scripts/opencluely-bridge/visual-scan-bridge.js b/scripts/opencluely-bridge/visual-scan-bridge.js
+index 8934b9b..91e1424 100644
+--- a/scripts/opencluely-bridge/visual-scan-bridge.js
++++ b/scripts/opencluely-bridge/visual-scan-bridge.js
+@@ -46,8 +46,12 @@ module.exports = {
+     return manager.permissionState();
+   },
+   async stop() {
+-    const manager = await loadManager();
+-    return manager.stop();
++    try {
++      const manager = await loadManager();
++      return manager.stop();
++    } catch (_) {
++      return { ok: true };
++    }
+   },
+   async setQuality(quality) {
+     const manager = await loadManager();
 -- 
 2.43.0
 

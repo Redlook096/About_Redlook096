@@ -32,9 +32,13 @@ final class OverlayPanel: NSPanel {
         isReleasedWhenClosed = true
         hidesOnDeactivate = false
         becomesKeyOnlyIfNeeded = true
+        // Exclude from screencapture / Zoom — user still sees the animation.
+        // This prevents "what's on my screen" from photographing the scan overlay.
+        sharingType = .none
 
         let content = NSView(frame: CGRect(origin: .zero, size: display.size))
         content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.clear.cgColor
         content.layer?.addSublayer(animationController.layer)
         contentView = content
     }

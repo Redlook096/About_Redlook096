@@ -54,19 +54,22 @@ function formatEnvValue(raw) {
 // This kills the entire app and can leave orphan helper processes that
 // exhaust the X11 client limit, producing "Maximum number of clients reached".
 //
-// Disabling hardware acceleration and the GPU subprocess forces Chromium to
-// render via the CPU (SwiftShader). OpenCluely's UI is light enough that
-// this is imperceptible, and it eliminates the GPU crash entirely.
+// We disable the GPU *subprocess* but MUST keep compositing + transparent
+// visuals enabled — otherwise the Visual Intelligence Scan fullscreen overlay
+// paints opaque black and appears to "hide all apps".
 if (process.platform === "linux") {
   app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("enable-transparent-visuals");
   app.commandLine.appendSwitch("disable-gpu");
-  app.commandLine.appendSwitch("disable-gpu-compositing");
-  app.commandLine.appendSwitch("disable-software-rasterizer");
+  // Do NOT set disable-gpu-compositing — breaks BrowserWindow transparency.
   app.commandLine.appendSwitch("disable-gpu-sandbox");
   // On X11 only; harmless on Wayland. Prevents Chromium from spawning a
   // compositor process that adds another X11 client.
   app.commandLine.appendSwitch("in-process-gpu");
 }
+
+// macOS / Windows: ensure transparent overlays (scan) composite correctly.
+app.commandLine.appendSwitch("enable-transparent-visuals");
 
 // Keep Chromium network noise out of the terminal; app-level logs still go through Winston.
 app.commandLine.appendSwitch("log-level", "3");
@@ -1369,27 +1372,46 @@ class ApplicationController {
     );
   }
 
+  /**
+   * Capture the real desktop WITHOUT hiding apps/windows.
+   * Hiding Electron overlays causes macOS focus/Space flicker that looks like
+   * "all apps disappeared". Instead we content-protect our overlays so they
+   * are omitted from the screenshot while remaining visible to the user.
+   */
   async #captureForAgent() {
-    const hiddenForCapture = [];
+    return this.#captureDesktopWithoutHiding({ fullScreen: true });
+  }
+
+  async #captureDesktopWithoutHiding(options = {}) {
+    const protectedWindows = [];
+    const restoreStealth = Boolean(this.stealthEnabled);
     try {
-      for (const [type, win] of windowManager.windows.entries()) {
-        if (!win || win.isDestroyed()) continue;
-        if (type === "main" || type === "chat" || type === "llmResponse" || type === "settings") {
-          if (win.isVisible()) {
-            hiddenForCapture.push(win);
-            win.hide();
-          }
+      // Never photograph an in-flight scan overlay. Stop it first — do not hide apps.
+      try {
+        await visualScanBridge.stop();
+      } catch (_) {
+        /* ignore */
+      }
+
+      for (const win of windowManager.windows.values()) {
+        if (!win || win.isDestroyed() || !win.isVisible()) continue;
+        try {
+          win.setContentProtection(true);
+          protectedWindows.push(win);
+        } catch (_) {
+          /* platform may not support content protection */
         }
       }
-      await new Promise((r) => setTimeout(r, 100));
-      // Full-screen capture so vision coordinates match the OS display
-      return await captureService.captureAndProcess({ fullScreen: true });
+      // One frame so the compositor applies protection before capture.
+      await new Promise((r) => setTimeout(r, 40));
+      return await captureService.captureAndProcess({
+        fullScreen: true,
+        ...options,
+      });
     } finally {
-      for (const win of hiddenForCapture) {
+      for (const win of protectedWindows) {
         try {
-          if (!win.isDestroyed()) {
-            windowManager.showOnCurrentDesktop(win, { focus: false, inactive: true });
-          }
+          if (!win.isDestroyed()) win.setContentProtection(restoreStealth);
         } catch (_) {
           /* ignore */
         }
@@ -1609,46 +1631,29 @@ class ApplicationController {
       return;
     }
 
-    // Visual Intelligence Scan — fire-and-forget, does not block capture.
-    visualScanBridge.fireVisualScan();
-
     const startTime = Date.now();
 
     try {
       windowManager.showLLMLoading();
 
-      // Hide OpenCluely overlays briefly so capture sees the real app (Chrome),
-      // not our own glass windows — otherwise vision hallucinates.
-      const hiddenForCapture = [];
-      try {
-        for (const [type, win] of windowManager.windows.entries()) {
-          if (!win || win.isDestroyed()) continue;
-          if (type === "main" || type === "chat" || type === "llmResponse" || type === "settings") {
-            if (win.isVisible()) {
-              hiddenForCapture.push(win);
-              win.hide();
-            }
-          }
-        }
-        await new Promise((r) => setTimeout(r, 120));
-      } catch (_) {
-        /* ignore */
-      }
-
+      // CRITICAL ORDER:
+      // 1) Capture the real desktop FIRST (never hide apps — that blanks macOS).
+      // 2) THEN start the Visual Intelligence Scan (content-protected overlay).
+      // Previously the scan overlay covered the screen *during* capture, so the
+      // model received a black/empty frame and users saw apps "disappear".
       let capture;
       try {
-        capture = await captureService.captureAndProcess();
-      } finally {
-        for (const win of hiddenForCapture) {
-          try {
-            if (!win.isDestroyed()) {
-            windowManager.showOnCurrentDesktop(win, { focus: false, inactive: true });
-          }
-          } catch (_) {
-            /* ignore */
-          }
-        }
+        capture = await this.#captureDesktopWithoutHiding({ fullScreen: true });
+      } catch (captureError) {
+        logger.warn("Protected capture failed; retrying plain capture", {
+          error: captureError.message,
+        });
+        capture = await captureService.captureAndProcess({ fullScreen: true });
       }
+
+      // Fire scan after pixels are safe — overlay is front-most but excluded
+      // from future captures via setContentProtection.
+      visualScanBridge.fireVisualScan();
 
       if (!capture.imageBuffer || !capture.imageBuffer.length) {
         windowManager.hideLLMResponse();
